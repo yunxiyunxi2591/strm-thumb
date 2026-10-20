@@ -26,6 +26,7 @@ from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 # ---------------- 配置 ----------------
 
@@ -233,6 +234,30 @@ def save_config(new):
     _cfg_changed.set()                      # 唤醒调度线程重读
     log("配置已保存并写入 %s" % CONFIG_PATH)
     return True, "已保存"
+
+
+def browse_dir(path):
+    """列出目录的子目录(供前端下拉选择); 返回 (clean, parent, dirs, err)"""
+    try:
+        p = Path(path or "/")
+        if not p.is_absolute():
+            p = Path("/") / p
+        p = Path(os.path.normpath(str(p)))
+        if not p.is_dir():
+            return None, None, None, "目录不存在或不是目录: %s" % path
+        dirs = []
+        for entry in sorted(p.iterdir(), key=lambda e: e.name.lower()):
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    dirs.append(entry.name)
+            except Exception:
+                continue
+            if len(dirs) >= 500:
+                break
+        parent = str(p.parent) if p != p.parent else None
+        return str(p), parent, dirs, None
+    except Exception as e:
+        return None, None, None, repr(e)
 
 
 # ---------------- cron 解析(5 段: 分 时 日 月 周) ----------------
@@ -532,6 +557,30 @@ html[data-theme="dark"] .fld input,html[data-theme="dark"] .fld select,html[data
 .savebar{display:flex;align-items:center;gap:12px;margin-top:14px}
 .savebar .msg{font-size:12px;font-weight:700;color:#16a34a}
 .savebar .msg.err{color:#ef4444}
+.picker{display:flex;gap:8px;align-items:center}
+.picker select{flex:1;background:var(--bg2);color:var(--ink);border:1px solid rgba(0,0,0,.12);
+  border-radius:8px;padding:8px 10px;font-size:13px;font-family:inherit}
+html[data-theme="dark"] .picker select{border-color:rgba(255,255,255,.14)}
+.picker button,.addrow button{flex:none;padding:8px 12px;font-size:12px;border-radius:8px}
+.crumbs{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px;font-size:12px;color:var(--sub)}
+.crumbs span{cursor:pointer;padding:2px 6px;border-radius:6px}
+.crumbs span:hover{background:var(--track);color:var(--ink)}
+.crumbs span.cur{color:var(--ink);font-weight:700;cursor:default}
+.crumbs span.cur:hover{background:transparent}
+.crumbs i{color:var(--faint);font-style:normal;align-self:center}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{display:inline-flex;align-items:center;gap:6px;background:rgba(34,197,94,.12);
+  border:1px solid rgba(34,197,94,.35);color:#15803d;border-radius:999px;
+  padding:3px 6px 3px 11px;font-size:12px;font-weight:700;max-width:100%}
+html[data-theme="dark"] .chip{color:#4ade80}
+.chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chip b{cursor:pointer;opacity:.6;padding:0 3px}
+.chip b:hover{opacity:1}
+.chips .empty{font-size:12px;color:var(--faint)}
+.addrow{display:flex;gap:8px;margin-top:8px}
+.addrow input{flex:1;background:var(--bg2);color:var(--ink);border:1px solid rgba(0,0,0,.12);
+  border-radius:8px;padding:8px 10px;font-size:13px;font-family:inherit}
+html[data-theme="dark"] .addrow input{border-color:rgba(255,255,255,.14)}
 </style>
 </head>
 <body>
@@ -573,8 +622,19 @@ html[data-theme="dark"] .fld input,html[data-theme="dark"] .fld select,html[data
     <h2>配置(保存后写入 /data/config.json, 重启不丢失)</h2>
     <div class="frm">
       <div class="fld wide">
-        <label>扫描目录(每行一个, 容器内路径)</label>
-        <textarea id="f-scan" spellcheck="false"></textarea>
+        <label>扫描目录(下拉进入选择, 可添加多个)</label>
+        <div class="picker">
+          <select id="f-browse" title="选择子目录后点「进入」"></select>
+          <button type="button" class="gray" onclick="browseEnter()">进入 ↓</button>
+          <button type="button" onclick="browseAdd()">＋ 添加当前目录</button>
+        </div>
+        <div class="crumbs" id="f-crumbs"></div>
+        <div class="chips" id="f-chips"></div>
+        <div class="addrow">
+          <input id="f-manual" placeholder="或手动输入容器内路径, 如 /link/电影" spellcheck="false">
+          <button type="button" class="gray" onclick="browseAddManual()">添加</button>
+        </div>
+        <span class="hint">浏览的是容器内目录(把媒体库挂载到 /link 后, 在这里一层层点进去)</span>
       </div>
       <div class="fld wide">
         <label>排除目录(每行一个, 可留空)</label>
@@ -642,53 +702,129 @@ function toggleTheme(){
   document.documentElement.setAttribute('data-theme',s||'light')})();
 
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-async function refresh(){
+// 带超时的 fetch: 后端无响应时 8 秒放弃, 绝不把页面卡在"加载中"
+async function fetchJSON(url,opts,ms){
+  const ac=new AbortController();
+  const timer=setTimeout(()=>ac.abort(),ms||8000);
   try{
-    const r=await fetch('/api/state'); const d=await r.json();
-    document.getElementById('meta').textContent =
-      d.scanning? '扫描中 '+d.processed+' 个' : '空闲 · 下次 '+d.next_run;
-    const st=document.getElementById('s-state');
-    st.innerHTML = d.scanning? '<span class="tag run">扫描中</span>' : '<span class="tag idle">空闲</span>';
-    document.getElementById('s-src').textContent=d.scan_source||'-';
-    document.getElementById('s-path').textContent=d.cur_path||'-';
-    document.getElementById('s-proc').textContent=d.processed;
-    document.getElementById('s-next').textContent=d.next_run;
-    document.getElementById('s-start').textContent=d.started_at;
-    document.getElementById('s-bar').style.width=(d.scanning?'100%':'0%');
-    document.getElementById('t-gen').textContent=d.generated_total;
-    document.getElementById('t-skip').textContent=d.skipped_total;
-    document.getElementById('t-fail').textContent=d.failed_total;
-    document.getElementById('t-last').textContent=d.last_stats?
-      ('尝试 '+d.last_stats.tried+' / 成功 '+d.last_stats.ok+' / 跳过 '+d.last_stats.skipped):'-';
-    const c=d.config;
-    // 填充配置表单(跳过用户正在编辑的框, 避免输入被打断)
-    const F=(id,v)=>{const el=document.getElementById(id);
-      if(el&&document.activeElement!==el)el.value=v;};
-    F('f-scan',(c.scan_paths||[]).join('\n'));
-    F('f-excl',(c.exclude_paths||[]).join('\n'));
-    F('f-timeline',c.timeline);F('f-suffix',c.suffix);
-    F('f-overwrite',c.overwrite?'1':'0');F('f-strategy',c.gen_strategy);
-    F('f-cron',c.cron||'');F('f-interval',c.interval);
-    F('f-runstart',c.run_on_start?'1':'0');F('f-timeout',c.timeout);
-    const box=document.getElementById('logs');
-    const atBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-30;
-    box.textContent=(d.logs||[]).join('\\n')||'(暂无日志)';
-    if(atBottom)box.scrollTop=box.scrollHeight;
-    document.getElementById('btn-run').disabled=!!d.scanning;
-    document.getElementById('btn-stop').disabled=!d.scanning;
-  }catch(e){document.getElementById('meta').textContent='加载失败'}
+    const r=await fetch(url,Object.assign({},opts||{},{signal:ac.signal}));
+    return await r.json();
+  }finally{clearTimeout(timer);}
+}
+function flashMsg(t,err){
+  const m=document.getElementById('save-msg');
+  m.className=err?'msg err':'msg'; m.textContent=(err?'✕ ':'')+t;
+  setTimeout(()=>{m.className='msg';m.textContent='';},3000);
+}
+// ---- 扫描目录选择器 ----
+let browsePath='/',scanList=[],scanDirty=false,pickerInited=false;
+async function browseTo(p){
+  browsePath=p; renderCrumbs();
+  const sel=document.getElementById('f-browse');
+  sel.innerHTML='<option value="">(读取中…)</option>';
+  let d;
+  try{ d=await fetchJSON('/api/browse?path='+encodeURIComponent(p),null,8000); }
+  catch(e){ sel.innerHTML='<option value="">(读取失败, 点「进入」重试)</option>'; return; }
+  if(!d.dirs||!d.dirs.length){ sel.innerHTML='<option value="">(此目录下没有子目录)</option>'; return; }
+  sel.innerHTML='<option value="">— 选择子目录('+d.dirs.length+') —</option>'+
+    d.dirs.map(x=>'<option value="'+esc(x)+'">'+esc(x)+'</option>').join('');
+  sel.selectedIndex=0;
+}
+function browseEnter(){
+  const sel=document.getElementById('f-browse');
+  const v=sel.value; if(!v)return;
+  browseTo(browsePath==='/'?'/'+v:browsePath+'/'+v);
+}
+function browseAdd(){
+  if(!browsePath||browsePath==='/'){flashMsg('不能添加根目录 /, 请先进入子目录',true);return;}
+  if(scanList.indexOf(browsePath)<0){scanList.push(browsePath);scanDirty=true;renderChips();}
+}
+function browseAddManual(){
+  const el=document.getElementById('f-manual');
+  const v=el.value.trim(); if(!v)return;
+  if(scanList.indexOf(v)<0){scanList.push(v);scanDirty=true;renderChips();}
+  el.value='';
+}
+function scanRemove(i){scanList.splice(i,1);scanDirty=true;renderChips();}
+function renderChips(){
+  const box=document.getElementById('f-chips');
+  if(!scanList.length){box.innerHTML='<span class="empty">尚未添加扫描目录</span>';return;}
+  box.innerHTML=scanList.map((p,i)=>'<span class="chip"><span title="'+esc(p)+'">'+esc(p)+
+    '</span><b onclick="scanRemove('+i+')" title="移除">✕</b></span>').join('');
+}
+function renderCrumbs(){
+  const box=document.getElementById('f-crumbs');
+  const parts=browsePath.split('/').filter(x=>x);
+  let html='<span onclick="browseTo(\'/\')">/</span>',acc='';
+  parts.forEach((seg,i)=>{
+    acc+='/'+seg;
+    html+='<i>›</i>'+(i===parts.length-1?'<span class="cur">'+esc(seg)+'</span>':
+      '<span onclick="browseTo(\''+esc(acc)+'\')">'+esc(seg)+'</span>');
+  });
+  box.innerHTML=html;
+}
+async function refresh(){
+  let d;
+  try{
+    d=await fetchJSON('/api/state',null,8000);
+  }catch(e){
+    const m=document.getElementById('meta');
+    m.textContent='⚠ 加载失败(点我重试)';
+    m.style.cursor='pointer'; m.style.color='#ef4444'; m.title=String(e);
+    m.onclick=function(){m.onclick=null;m.style.color='';m.style.cursor='';refresh();};
+    return;
+  }
+  const m0=document.getElementById('meta');
+  m0.style.color='';m0.style.cursor='';m0.onclick=null;
+  m0.textContent = d.scanning? '扫描中 '+d.processed+' 个' : '空闲 · 下次 '+d.next_run;
+  const st=document.getElementById('s-state');
+  st.innerHTML = d.scanning? '<span class="tag run">扫描中</span>' : '<span class="tag idle">空闲</span>';
+  document.getElementById('s-src').textContent=d.scan_source||'-';
+  document.getElementById('s-path').textContent=d.cur_path||'-';
+  document.getElementById('s-proc').textContent=d.processed;
+  document.getElementById('s-next').textContent=d.next_run;
+  document.getElementById('s-start').textContent=d.started_at;
+  document.getElementById('s-bar').style.width=(d.scanning?'100%':'0%');
+  document.getElementById('t-gen').textContent=d.generated_total;
+  document.getElementById('t-skip').textContent=d.skipped_total;
+  document.getElementById('t-fail').textContent=d.failed_total;
+  document.getElementById('t-last').textContent=d.last_stats?
+    ('尝试 '+d.last_stats.tried+' / 成功 '+d.last_stats.ok+' / 跳过 '+d.last_stats.skipped):'-';
+  const c=d.config;
+  // 填充配置表单(跳过用户正在编辑的框, 避免输入被打断)
+  const F=(id,v)=>{const el=document.getElementById(id);
+    if(el&&document.activeElement!==el)el.value=v;};
+  F('f-excl',(c.exclude_paths||[]).join('\n'));
+  F('f-timeline',c.timeline);F('f-suffix',c.suffix);
+  F('f-overwrite',c.overwrite?'1':'0');F('f-strategy',c.gen_strategy);
+  F('f-cron',c.cron||'');F('f-interval',c.interval);
+  F('f-runstart',c.run_on_start?'1':'0');F('f-timeout',c.timeout);
+  // 扫描目录: 用户未在本地增删时, 以后端配置为准
+  if(!scanDirty && JSON.stringify(c.scan_paths||[])!==JSON.stringify(scanList)){
+    scanList=(c.scan_paths||[]).slice(); renderChips();
+  }
+  if(!pickerInited){pickerInited=true; renderChips(); browseTo(scanList[0]||'/');}
+  const box=document.getElementById('logs');
+  const atBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-30;
+  box.textContent=(d.logs||[]).join('\\n')||'(暂无日志)';
+  if(atBottom)box.scrollTop=box.scrollHeight;
+  document.getElementById('btn-run').disabled=!!d.scanning;
+  document.getElementById('btn-stop').disabled=!d.scanning;
 }
 async function runNow(){
-  await fetch('/api/run',{method:'POST'}); setTimeout(refresh,300);
+  try{await fetchJSON('/api/run',{method:'POST'},8000);}catch(e){}
+  setTimeout(refresh,300);
 }
 async function stopScan(){
-  await fetch('/api/stop',{method:'POST'}); setTimeout(refresh,300);
+  try{await fetchJSON('/api/stop',{method:'POST'},8000);}catch(e){}
+  setTimeout(refresh,300);
 }
 async function saveConfig(){
   const msg=document.getElementById('save-msg');
   const btn=document.getElementById('btn-save');
+  if(!scanList.length){flashMsg('请先添加至少一个扫描目录',true);return;}
   const body={
-    scan_paths:document.getElementById('f-scan').value,
+    scan_paths:scanList.join('\n'),
     exclude_paths:document.getElementById('f-excl').value,
     timeline:document.getElementById('f-timeline').value,
     suffix:document.getElementById('f-suffix').value,
@@ -701,12 +837,11 @@ async function saveConfig(){
   };
   btn.disabled=true; msg.className='msg'; msg.textContent='保存中…';
   try{
-    const r=await fetch('/api/config',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const d=await r.json();
-    if(d.ok){msg.textContent='✓ 已保存, 下次扫描生效'; setTimeout(()=>msg.textContent='',2500);}
-    else{msg.className='msg err'; msg.textContent='✕ '+(d.error||'保存失败'); setTimeout(()=>msg.className='msg',3000);}
-  }catch(e){msg.className='msg err'; msg.textContent='✕ 网络错误';}
+    const d=await fetchJSON('/api/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},10000);
+    if(d.ok){scanDirty=false; msg.textContent='✓ 已保存, 下次扫描生效'; setTimeout(()=>msg.textContent='',2500);}
+    else{flashMsg(d.error||'保存失败',true);}
+  }catch(e){flashMsg('网络错误或超时',true);}
   btn.disabled=false; setTimeout(refresh,200);
 }
 refresh(); setInterval(refresh,3000);
@@ -718,12 +853,14 @@ refresh(); setInterval(refresh,3000);
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 60                     # 单连接读超时, 防止半死连接占住线程
 
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         raw = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(raw)
 
@@ -748,6 +885,14 @@ class Handler(BaseHTTPRequestHandler):
                     "logs": list(STATE["logs"]),
                 }
             self._send(200, json.dumps(data))
+        elif self.path.split("?")[0] == "/api/browse":
+            q = parse_qs(urlparse(self.path).query)
+            clean, parent, dirs, err = browse_dir((q.get("path") or ["/"])[0])
+            if err:
+                self._send(400, json.dumps({"error": err}, ensure_ascii=False))
+            else:
+                self._send(200, json.dumps(
+                    {"path": clean, "parent": parent, "dirs": dirs}))
         else:
             self._send(404, '{"error":"not found"}')
 
