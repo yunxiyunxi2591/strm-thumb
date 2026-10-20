@@ -717,7 +717,7 @@ function flashMsg(t,err){
   setTimeout(()=>{m.className='msg';m.textContent='';},3000);
 }
 // ---- 扫描目录选择器 ----
-let browsePath='/',scanList=[],scanDirty=false,pickerInited=false;
+let browsePath='/',scanList=[],scanDirty=false;
 async function browseTo(p){
   browsePath=p; renderCrumbs();
   const sel=document.getElementById('f-browse');
@@ -769,8 +769,10 @@ async function refresh(){
     d=await fetchJSON('/api/state',null,8000);
   }catch(e){
     const m=document.getElementById('meta');
-    m.textContent='⚠ 加载失败(点我重试)';
-    m.style.cursor='pointer'; m.style.color='#ef4444'; m.title=String(e);
+    let why = (e&&e.name==='AbortError') ? '请求超时(8秒)' :
+             ((e&&e.name==='TypeError') ? '网络不通' : ('加载失败'));
+    m.textContent='⚠ '+why+'(点我重试)';
+    m.style.cursor='pointer'; m.style.color='#ef4444'; m.title=String(e&&e.stack||e);
     m.onclick=function(){m.onclick=null;m.style.color='';m.style.cursor='';refresh();};
     return;
   }
@@ -803,7 +805,6 @@ async function refresh(){
   if(!scanDirty && JSON.stringify(c.scan_paths||[])!==JSON.stringify(scanList)){
     scanList=(c.scan_paths||[]).slice(); renderChips();
   }
-  if(!pickerInited){pickerInited=true; renderChips(); browseTo(scanList[0]||'/');}
   const box=document.getElementById('logs');
   const atBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-30;
   box.textContent=(d.logs||[]).join('\\n')||'(暂无日志)';
@@ -844,7 +845,9 @@ async function saveConfig(){
   }catch(e){flashMsg('网络错误或超时',true);}
   btn.disabled=false; setTimeout(refresh,200);
 }
+// 状态轮询与目录选择器互相独立: 即使 /api/state 不通, 目录下拉照样能用
 refresh(); setInterval(refresh,3000);
+renderChips(); browseTo('/');
 </script>
 </body>
 </html>
@@ -861,13 +864,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
+        # 主动关闭连接: 避免某些网络环境(NAS 反代/Docker 网络)吞掉 keep-alive
+        # 连接上的后续请求, 导致页面能打开但 API 一直挂起; 3 秒轮询的页面开新连接开销可忽略
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(raw)
+        self.close_connection = True
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self._send(200, PAGE, "text/html; charset=utf-8")
         elif self.path == "/api/state":
+            _t0 = time.monotonic()
             with _scan_lock:
                 data = {
                     "scanning": STATE["scanning"],
@@ -884,7 +892,11 @@ class Handler(BaseHTTPRequestHandler):
                     "config": config_snapshot(),
                     "logs": list(STATE["logs"]),
                 }
-            self._send(200, json.dumps(data))
+            body = json.dumps(data)
+            _dt = time.monotonic() - _t0
+            if _dt > 2:      # 正常应毫秒级; 慢了说明服务端有阻塞, 记日志便于排查
+                log("⚠ /api/state 响应耗时 %.1f 秒(异常, 正常应毫秒级)" % _dt)
+            self._send(200, body)
         elif self.path.split("?")[0] == "/api/browse":
             q = parse_qs(urlparse(self.path).query)
             clean, parent, dirs, err = browse_dir((q.get("path") or ["/"])[0])
