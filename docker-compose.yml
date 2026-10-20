@@ -3,7 +3,7 @@
 #   docker compose up -d           启动
 #   docker compose logs -f         看日志
 #   docker compose pull && docker compose up -d   升级到新版本
-# 前端: http://NAS的IP:8080  (状态/统计/日志 + 手动触发扫描按钮)
+# 前端: http://NAS的IP:8081  (状态/统计/日志 + 手动触发扫描按钮; 8080 常被 qBittorrent 占用, 故默认 8081)
 
 services:
   strm-thumb:
@@ -11,7 +11,7 @@ services:
     container_name: strm-thumb
     restart: unless-stopped
     ports:
-      - "8080:8080"          # Web 前端端口
+      - "8081:8081"          # Web 前端端口
     environment:
       # 扫描目录: 多个用换行(或逗号)分隔, 注意是「容器内」路径, 与下面 volumes 对应
       SCAN_PATHS: "/link"
@@ -33,7 +33,7 @@ services:
       # 单个文件 ffmpeg 超时(秒), 慢速网盘可调大
       TIMEOUT: "300"
       # Web 前端端口; 设 0 关闭前端(只当后台 worker)
-      WEB_PORT: "8080"
+      WEB_PORT: "8081"
       WEB_ENABLED: "1"
     volumes:
       # 把你的 strm 媒体库挂到容器内 /link; 缩略图会生成在 .strm 同级目录
