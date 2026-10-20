@@ -7,7 +7,7 @@ STRM 缩略图生成器 — MoviePilot「FFmpegStrm缩略图」插件的容器�
 本容器不依赖 MoviePilot, 常驻运行, 定时扫描目录中的 .strm 文件,
 用 FFmpeg 从 strm 指向的视频里截取一帧, 保存为 <片名>-thumb.jpg。
 
-自带简易 Web 前端(默认 8080 端口): 查看状态/统计/日志, 手动触发扫描。
+自带简易 Web 前端(默认 8081 端口): 查看状态/统计/日志, 手动触发扫描。
 
 纯 Python 标准库, 零第三方依赖; 全部配置走环境变量。
 """
@@ -55,7 +55,7 @@ INTERVAL = int(_env("INTERVAL", "3600"))                        # 循环间隔(�
 RUN_ONCE = _env_bool("RUN_ONCE", "0")                           # 1=只跑一次就退出(首次补图用)
 FFMPEG = _env("FFMPEG_BIN", "ffmpeg")                           # ffmpeg 可执行文件
 FFMPEG_TIMEOUT = int(_env("TIMEOUT", "300"))                    # 单个文件 ffmpeg 超时(秒)
-WEB_PORT = int(_env("WEB_PORT", "8080"))                        # Web 前端端口
+WEB_PORT = int(_env("WEB_PORT", "8081"))                        # Web 前端端口
 WEB_ENABLED = _env_bool("WEB_ENABLED", "1")                     # 0=关掉前端, 只当 worker
 
 _STOP = False                # 退出进程
