@@ -7,12 +7,27 @@
 （Emby / Jellyfin / 飞牛影视 等在 TheMovieDb 没有背景图时就用它兜底）。
 
 > 纯 Python 标准库 + ffmpeg，零第三方依赖，单文件 `main.py`，全环境变量配置。
+> **自带 Web 前端**（默认 8080 端口）：实时看扫描状态/统计/日志，还能点按钮立即跑一轮。
+
+## Web 前端
+
+容器启动后访问 `http://NAS的IP:8080`（端口可用 `WEB_PORT` 改）：
+
+- **运行状态**：扫描中/空闲、触发来源（定时/手动）、当前目录、本轮已处理、下次扫描时间
+- **累计统计**：已生成 / 跳过（已存在）/ 失败 / 上轮结果
+- **操作按钮**：▶ 立即扫描一次、⏹ 停止当前扫描
+- **当前配置**：所有生效中的参数一目了然
+- **运行日志**：最近 300 行，自动滚动，3 秒刷新
+- 右上角 🌓 切换浅色/深色主题
+
+不需要前端就设 `WEB_ENABLED=0`（或 `WEB_PORT=0`），容器退化为纯后台 worker。
 
 ## 用法
 
 ```bash
 # 1) 把媒体库目录挂到容器内 /link，改 docker-compose.yml 里的 /path/to/media
 docker run -d --name strm-thumb --restart unless-stopped \
+  -p 8080:8080 \
   -v /path/to/media:/link \
   -e SCAN_PATHS=/link \
   -e TIMELINE=00:03:01 \
@@ -42,6 +57,8 @@ docker compose logs -f          # 看扫描/生成日志
 | `RUN_ONCE` | `0` | `1`=只跑一次就退出（首次补图用） |
 | `TIMEOUT` | `300` | 单个文件 ffmpeg 超时（秒），慢速网盘可调大 |
 | `FFMPEG_BIN` | `ffmpeg` | ffmpeg 可执行文件路径 |
+| `WEB_PORT` | `8080` | Web 前端端口；设 `0` 关闭前端 |
+| `WEB_ENABLED` | `1` | `0`=关掉前端，只当后台 worker |
 
 ## 与原版插件的对应关系
 
