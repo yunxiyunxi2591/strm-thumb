@@ -10,16 +10,19 @@ permissions:
   contents: read
 
 jobs:
+  # 先检查 Docker Hub 密钥是否已配置, 未配置则跳过构建而不是报错
   preflight:
     runs-on: ubuntu-latest
     outputs:
-      has-secrets: ${{ steps.c.outputs.has }}
+      has-secrets: ${{ steps.check.outputs.has }}
     steps:
-      - id: c
+      - name: Check Docker Hub secrets
+        id: check
         env:
-          S: ${{ toJSON(secrets) }}
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          if echo "$S" | grep -q '"DOCKERHUB_USERNAME"'; then
+          if [ -n "$DH_USER" ] && [ -n "$DH_TOKEN" ]; then
             echo "has=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN, 跳过构建(仓库首页不会变红)"
