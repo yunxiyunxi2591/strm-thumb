@@ -1,14 +1,17 @@
 # STRM 缩略图生成器 — docker compose 示例
 # 用法: 把 /path/to/media 改成你的 strm 媒体库目录, 然后 docker compose up -d
 #   docker compose up -d           启动
-#   docker compose logs -f         看日志(每个文件生成/跳过都会打印)
+#   docker compose logs -f         看日志
 #   docker compose pull && docker compose up -d   升级到新版本
+# 前端: http://NAS的IP:8080  (状态/统计/日志 + 手动触发扫描按钮)
 
 services:
   strm-thumb:
     image: chensen2591/strm-thumb:latest
     container_name: strm-thumb
     restart: unless-stopped
+    ports:
+      - "8080:8080"          # Web 前端端口
     environment:
       # 扫描目录: 多个用换行(或逗号)分隔, 注意是「容器内」路径, 与下面 volumes 对应
       SCAN_PATHS: "/link"
@@ -29,6 +32,9 @@ services:
       RUN_ONCE: "0"
       # 单个文件 ffmpeg 超时(秒), 慢速网盘可调大
       TIMEOUT: "300"
+      # Web 前端端口; 设 0 关闭前端(只当后台 worker)
+      WEB_PORT: "8080"
+      WEB_ENABLED: "1"
     volumes:
       # 把你的 strm 媒体库挂到容器内 /link; 缩略图会生成在 .strm 同级目录
       - /path/to/media:/link
