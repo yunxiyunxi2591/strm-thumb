@@ -14,11 +14,11 @@ ENV SCAN_PATHS=/link \
     GEN_STRATEGY=100=60 \
     OVERWRITE=0 \
     INTERVAL=3600 \
-    WEB_PORT=8080 \
+    WEB_PORT=8081 \
     WEB_ENABLED=1 \
     TZ=Asia/Shanghai
 
-EXPOSE 8080
+EXPOSE 8081
 VOLUME ["/link"]
 
 CMD ["python", "-u", "main.py"]
