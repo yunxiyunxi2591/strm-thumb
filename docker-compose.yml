@@ -4,6 +4,10 @@
 #   docker compose logs -f         看日志
 #   docker compose pull && docker compose up -d   升级到新版本
 # 前端: http://NAS的IP:8081  (状态/统计/日志 + 手动触发扫描按钮; 8080 常被 qBittorrent 占用, 故默认 8081)
+#
+# ★ 默认全手动: 容器启动后不会自动扫描, 打开 Web 点「▶ 立即扫描一次」才开始干活;
+#   所有配置(扫描目录/排除目录/截取时间点/策略/定时等)都在 Web 上改, 保存进 ./data/config.json,
+#   重启不丢失; 想改回"启动即扫"可在 Web 配置里打开「启动时自动扫描」。
 
 services:
   strm-thumb:
@@ -14,6 +18,7 @@ services:
       - "8081:8081"          # Web 前端端口
     environment:
       # 扫描目录: 多个用换行(或逗号)分隔, 注意是「容器内」路径, 与下面 volumes 对应
+      # (首次部署用这里; 一旦 Web 上保存过配置, 就以 ./data/config.json 为准)
       SCAN_PATHS: "/link"
       # 排除目录(可选), 同样换行分隔
       EXCLUDE_PATHS: ""
@@ -23,13 +28,13 @@ services:
       OVERWRITE: "0"
       # 每生成 N 个暂停 M 秒, 防止被网盘/风控限速
       GEN_STRATEGY: "100=60"
-      # 定时: 5 位 cron 表达式(容器内 UTC 时间); 留空则按 INTERVAL 循环
+      # 定时: 5 位 cron 表达式(容器内 UTC 时间); 留空 + INTERVAL=0 = 纯手动, 不自动扫
       # 例: "30 20 * * *" = 每天 UTC 20:30(北京 04:30)
       CRON: ""
-      # 未设置 CRON 时的循环间隔(秒)
-      INTERVAL: "3600"
-      # 1=只跑一次就退出(首次批量补图时用, 配 OVERWRITE=0 只补缺失)
-      RUN_ONCE: "0"
+      # 循环间隔(秒); 0 = 不循环(仅手动点扫描)
+      INTERVAL: "0"
+      # 1=容器启动时自动先扫一轮; 0=启动后待命, 只手动触发(默认)
+      RUN_ON_START: "0"
       # 单个文件 ffmpeg 超时(秒), 慢速网盘可调大
       TIMEOUT: "300"
       # Web 前端端口; 设 0 关闭前端(只当后台 worker)
@@ -38,3 +43,5 @@ services:
     volumes:
       # 把你的 strm 媒体库挂到容器内 /link; 缩略图会生成在 .strm 同级目录
       - /path/to/media:/link
+      # 配置文件持久化: Web 上保存的配置写在这里, 重建容器不丢
+      - ./data:/data
