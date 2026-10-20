@@ -1,0 +1,34 @@
+# STRM 缩略图生成器 — docker compose 示例
+# 用法: 把 /path/to/media 改成你的 strm 媒体库目录, 然后 docker compose up -d
+#   docker compose up -d           启动
+#   docker compose logs -f         看日志(每个文件生成/跳过都会打印)
+#   docker compose pull && docker compose up -d   升级到新版本
+
+services:
+  strm-thumb:
+    image: chensen2591/strm-thumb:latest
+    container_name: strm-thumb
+    restart: unless-stopped
+    environment:
+      # 扫描目录: 多个用换行(或逗号)分隔, 注意是「容器内」路径, 与下面 volumes 对应
+      SCAN_PATHS: "/link"
+      # 排除目录(可选), 同样换行分隔
+      EXCLUDE_PATHS: ""
+      # 截取时间点 HH:MM:SS
+      TIMELINE: "00:03:01"
+      # 1=对所有文件重新生成; 0=只补缺失的(默认)
+      OVERWRITE: "0"
+      # 每生成 N 个暂停 M 秒, 防止被网盘/风控限速
+      GEN_STRATEGY: "100=60"
+      # 定时: 5 位 cron 表达式(容器内 UTC 时间); 留空则按 INTERVAL 循环
+      # 例: "30 20 * * *" = 每天 UTC 20:30(北京 04:30)
+      CRON: ""
+      # 未设置 CRON 时的循环间隔(秒)
+      INTERVAL: "3600"
+      # 1=只跑一次就退出(首次批量补图时用, 配 OVERWRITE=0 只补缺失)
+      RUN_ONCE: "0"
+      # 单个文件 ffmpeg 超时(秒), 慢速网盘可调大
+      TIMEOUT: "300"
+    volumes:
+      # 把你的 strm 媒体库挂到容器内 /link; 缩略图会生成在 .strm 同级目录
+      - /path/to/media:/link
