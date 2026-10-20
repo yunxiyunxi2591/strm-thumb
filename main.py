@@ -7,9 +7,13 @@ STRM 缩略图生成器 — MoviePilot「FFmpegStrm缩略图」插件的容器�
 本容器不依赖 MoviePilot, 常驻运行, 定时扫描目录中的 .strm 文件,
 用 FFmpeg 从 strm 指向的视频里截取一帧, 保存为 <片名>-thumb.jpg。
 
-自带简易 Web 前端(默认 8081 端口): 查看状态/统计/日志, 手动触发扫描。
+自带简易 Web 前端(默认 8081 端口): 查看状态/统计/日志, 手动触发扫描,
+并可在页面上编辑全部配置(保存到 /data/config.json, 重启不丢失)。
 
-纯 Python 标准库, 零第三方依赖; 全部配置走环境变量。
+默认完全手动: 容器启动不自动扫描, 也不循环; 需要定时可在 Web 上配置
+cron 或循环间隔, 需要启动即扫可打开「启动时自动扫描」。
+
+纯 Python 标准库, 零第三方依赖; 初始配置走环境变量, 之后以配置文件为准。
 """
 import json
 import os
@@ -44,22 +48,37 @@ def _split_multi(v):
     return parts
 
 
-SCAN_PATHS = _split_multi(_env("SCAN_PATHS", "/link"))          # 扫描目录, 多个换行分隔
-EXCLUDE_PATHS = _split_multi(_env("EXCLUDE_PATHS", ""))         # 排除目录
-TIMELINE = _env("TIMELINE", "00:03:01")                         # 截取时间点 HH:MM:SS
-SUFFIX = _env("SUFFIX", "-thumb.jpg")                           # 缩略图后缀
-OVERWRITE = _env_bool("OVERWRITE", "0")                         # 1=覆盖生成(默认只补缺失)
-GEN_STRATEGY = _env("GEN_STRATEGY", "100=60")                   # 每生成 N 个暂停 M 秒
-CRON = _env("CRON", "")                                         # 5 位 cron, 留空则按 INTERVAL 循环
-INTERVAL = int(_env("INTERVAL", "3600"))                        # 循环间隔(秒)
-RUN_ONCE = _env_bool("RUN_ONCE", "0")                           # 1=只跑一次就退出(首次补图用)
+SCAN_PATHS_DEFAULT = _split_multi(_env("SCAN_PATHS", "/link"))
+CONFIG_PATH = _env("CONFIG_PATH", "/data/config.json")   # 配置文件路径(可挂卷持久化)
+
+# 运行时可调配置: 环境变量/默认值为初始值, 配置文件(若存在)整体覆盖, Web 保存后写回文件
+CFG = {
+    "scan_paths": SCAN_PATHS_DEFAULT,                    # 扫描目录, 多个换行分隔
+    "exclude_paths": _split_multi(_env("EXCLUDE_PATHS", "")),  # 排除目录
+    "timeline": _env("TIMELINE", "00:03:01"),            # 截取时间点 HH:MM:SS
+    "suffix": _env("SUFFIX", "-thumb.jpg"),              # 缩略图后缀
+    "overwrite": _env_bool("OVERWRITE", "0"),            # True=覆盖生成(默认只补缺失)
+    "gen_strategy": _env("GEN_STRATEGY", "100=60"),      # 每生成 N 个暂停 M 秒
+    "cron": _env("CRON", ""),                            # 5 位 cron; 留空=不按 cron 定时
+    "interval": int(_env("INTERVAL", "0")),              # 循环间隔(秒); 0=不循环(仅手动)
+    "run_on_start": _env_bool("RUN_ON_START", "0"),      # True=启动时自动扫一轮
+    "timeout": int(_env("TIMEOUT", "300")),              # 单个文件 ffmpeg 超时(秒)
+}
+CFG_SOURCE = "环境变量/默认值"      # 当前配置来源(启动日志用)
+
 FFMPEG = _env("FFMPEG_BIN", "ffmpeg")                           # ffmpeg 可执行文件
-FFMPEG_TIMEOUT = int(_env("TIMEOUT", "300"))                    # 单个文件 ffmpeg 超时(秒)
-WEB_PORT = int(_env("WEB_PORT", "8081"))                        # Web 前端端口
+RUN_ONCE = _env_bool("RUN_ONCE", "0")                           # 1=只跑一次就退出(首次补图用)
+WEB_PORT = int(_env("WEB_PORT", "8081"))                        # Web 前端端口(改端口需重启容器)
 WEB_ENABLED = _env_bool("WEB_ENABLED", "1")                     # 0=关掉前端, 只当 worker
+
+# 可由 Web 编辑的字段(不含 web_port: 改端口要重启 HTTP 服务)
+EDITABLE = ("scan_paths", "exclude_paths", "timeline", "suffix",
+            "overwrite", "gen_strategy", "cron", "interval",
+            "run_on_start", "timeout")
 
 _STOP = False                # 退出进程
 _STOP_SCAN = False           # 停止当前扫描轮
+_cfg_changed = threading.Event()   # 配置已保存, 唤醒调度线程重读
 
 # ---------------- 状态(供前端展示) ----------------
 
@@ -89,18 +108,131 @@ def log(msg):
 
 
 def config_snapshot():
-    return {
-        "scan_paths": SCAN_PATHS,
-        "exclude_paths": EXCLUDE_PATHS,
-        "timeline": TIMELINE,
-        "suffix": SUFFIX,
-        "overwrite": OVERWRITE,
-        "gen_strategy": GEN_STRATEGY,
-        "cron": CRON or ("每 %d 秒" % INTERVAL),
-        "run_once": RUN_ONCE,
-        "timeout": FFMPEG_TIMEOUT,
-        "web_port": WEB_PORT if WEB_ENABLED else None,
-    }
+    """返回当前生效配置(供前端展示与表单填充)"""
+    snap = {k: CFG[k] for k in EDITABLE}
+    if CFG["cron"]:
+        snap["schedule_display"] = "cron: %s" % CFG["cron"]
+    elif CFG["interval"] > 0:
+        snap["schedule_display"] = "每 %d 秒" % CFG["interval"]
+    else:
+        snap["schedule_display"] = "仅手动触发"
+    return snap
+
+
+# ---------------- 配置文件读写 ----------------
+
+def _as_list(v):
+    if isinstance(v, (list, tuple)):
+        return [str(x).strip() for x in v if str(x).strip()]
+    return _split_multi(v)
+
+
+def _as_bool(v):
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _as_int(v, default=0):
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+
+def load_config_file():
+    """启动时调用: 配置文件存在则整体覆盖环境变量配置。返回 (ok, err)"""
+    global CFG_SOURCE
+    try:
+        p = Path(CONFIG_PATH)
+        if not p.is_file():
+            return True, None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return False, "配置文件不是 JSON 对象"
+        merged = dict(CFG)
+        for k in EDITABLE:
+            if k in data and data[k] not in (None, ""):
+                merged[k] = data[k]
+        merged["scan_paths"] = _as_list(merged["scan_paths"])
+        merged["exclude_paths"] = _as_list(merged["exclude_paths"])
+        merged["overwrite"] = _as_bool(merged["overwrite"])
+        merged["run_on_start"] = _as_bool(merged["run_on_start"])
+        merged["interval"] = max(_as_int(merged["interval"]), 0)
+        merged["timeout"] = max(_as_int(merged["timeout"], 300), 10)
+        merged["timeline"] = str(merged["timeline"]).strip()
+        merged["suffix"] = str(merged["suffix"]).strip()
+        merged["gen_strategy"] = str(merged["gen_strategy"]).strip()
+        merged["cron"] = str(merged["cron"]).strip()
+        CFG.update(merged)
+        CFG_SOURCE = CONFIG_PATH
+        return True, None
+    except Exception as e:
+        return False, repr(e)
+
+
+def validate_config(new):
+    """校验 Web 提交的配置; 返回 (clean_dict, err_msg)"""
+    out = {}
+    scan_paths = _as_list(new.get("scan_paths"))
+    if not scan_paths:
+        return None, "扫描目录不能为空"
+    out["scan_paths"] = scan_paths
+    out["exclude_paths"] = _as_list(new.get("exclude_paths"))
+    tl = str(new.get("timeline", "")).strip()
+    parts = tl.split(":")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None, "截取时间点格式应为 HH:MM:SS"
+    h, m, s = (int(p) for p in parts)
+    if not (0 <= h <= 23 and 0 <= m <= 59 and 0 <= s <= 59):
+        return None, "截取时间点超出范围(HH 0-23, MM/SS 0-59)"
+    out["timeline"] = "%02d:%02d:%02d" % (h, m, s)
+    suffix = str(new.get("suffix", "")).strip()
+    if not suffix:
+        return None, "缩略图后缀不能为空"
+    out["suffix"] = suffix
+    out["overwrite"] = _as_bool(new.get("overwrite"))
+    gs = str(new.get("gen_strategy", "")).strip()
+    if "=" not in gs:
+        return None, "生成策略格式应为 N=M(每生成 N 个暂停 M 秒)"
+    try:
+        n, m = (int(x) for x in gs.split("=", 1))
+        if n <= 0 or m < 0:
+            raise ValueError
+    except Exception:
+        return None, "生成策略应为正整数=非负整数, 如 100=60"
+    out["gen_strategy"] = gs
+    cron = str(new.get("cron", "")).strip()
+    if cron:
+        try:
+            Cron(cron)
+        except Exception as e:
+            return None, "cron 表达式错误: %r(需要 5 段: 分 时 日 月 周)" % e
+    out["cron"] = cron
+    out["interval"] = max(_as_int(new.get("interval")), 0)
+    out["run_on_start"] = _as_bool(new.get("run_on_start"))
+    out["timeout"] = min(max(_as_int(new.get("timeout"), 300), 10), 3600)
+    return out, None
+
+
+def save_config(new):
+    """校验 → 更新 CFG → 写文件 → 唤醒调度线程。返回 (ok, msg)"""
+    clean, err = validate_config(new)
+    if err:
+        return False, err
+    CFG.update(clean)
+    try:
+        p = Path(CONFIG_PATH)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps({k: CFG[k] for k in EDITABLE},
+                                  ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(p)                      # 原子替换, 避免写一半
+    except Exception as e:
+        return False, "配置已生效但写入文件失败: %r(重启后将丢失本次修改)" % e
+    _cfg_changed.set()                      # 唤醒调度线程重读
+    log("配置已保存并写入 %s" % CONFIG_PATH)
+    return True, "已保存"
 
 
 # ---------------- cron 解析(5 段: 分 时 日 月 周) ----------------
@@ -191,7 +323,7 @@ def gen_thumb(strm_path, thumb_path, timeline):
            "-vframes", "1", "-f", "image2", "-y", thumb_path]
     try:
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, timeout=FFMPEG_TIMEOUT)
+                           text=True, timeout=CFG["timeout"])
         if r.returncode == 0 and os.path.exists(thumb_path) and \
                 os.path.getsize(thumb_path) > 0:
             return True
@@ -199,7 +331,7 @@ def gen_thumb(strm_path, thumb_path, timeline):
                                      (r.stderr or "").strip().split("\n")[-1][:200]))
         return False
     except subprocess.TimeoutExpired:
-        log("ffmpeg 超时(%ss): %s" % (FFMPEG_TIMEOUT, strm_path))
+        log("ffmpeg 超时(%ss): %s" % (CFG["timeout"], strm_path))
     except FileNotFoundError:
         log("找不到 %s, 请确认镜像内已安装 ffmpeg" % FFMPEG)
     except Exception as e:
@@ -207,15 +339,15 @@ def gen_thumb(strm_path, thumb_path, timeline):
     return False
 
 
-def scan_once(source="定时"):
+def scan_once(source="手动"):
     """扫描一轮, 返回 (尝试数, 成功数, 跳过数)"""
-    if not SCAN_PATHS:
-        log("SCAN_PATHS 为空, 无可扫描目录")
+    if not CFG["scan_paths"]:
+        log("扫描目录为空, 无可扫描目录")
         return 0, 0, 0
     global _STOP_SCAN
     _STOP_SCAN = False
     try:
-        max_count, delay = GEN_STRATEGY.split("=")
+        max_count, delay = CFG["gen_strategy"].split("=")
         max_count, delay = int(max_count), int(delay)
     except Exception:
         max_count, delay = 100, 60
@@ -224,7 +356,7 @@ def scan_once(source="定时"):
     STATE.update(scanning=True, scan_source=source, cur_path="", cur_file="",
                  processed=0, last_start=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     try:
-        for base in SCAN_PATHS:
+        for base in CFG["scan_paths"]:
             if _STOP_SCAN or _STOP:
                 break
             root = Path(base)
@@ -232,7 +364,7 @@ def scan_once(source="定时"):
                 log("扫描路径不存在, 跳过: %s" % base)
                 continue
             excl = []
-            for e in EXCLUDE_PATHS:
+            for e in CFG["exclude_paths"]:
                 try:
                     excl.append(str(Path(e).resolve()))
                 except Exception:
@@ -251,8 +383,8 @@ def scan_once(source="定时"):
                         continue
                 except Exception:
                     pass
-                thumb = fp.with_name(fp.stem + SUFFIX)
-                if not OVERWRITE and thumb.exists():
+                thumb = fp.with_name(fp.stem + CFG["suffix"])
+                if not CFG["overwrite"] and thumb.exists():
                     skipped += 1
                     STATE["skipped_total"] += 1
                     continue
@@ -261,7 +393,7 @@ def scan_once(source="定时"):
                     log("strm 内容为空, 跳过: %s" % fp)
                     continue
                 tried += 1
-                if gen_thumb(src, str(thumb), TIMELINE):
+                if gen_thumb(src, str(thumb), CFG["timeline"]):
                     ok += 1
                     STATE["generated_total"] += 1
                     log("已生成: %s" % thumb.name)
@@ -281,39 +413,59 @@ def scan_once(source="定时"):
 
 
 def worker():
-    cron = None
-    if CRON:
-        try:
-            cron = Cron(CRON)
-        except Exception as e:
-            log("CRON 解析失败(%r), 改用每 %d 秒循环" % (e, INTERVAL))
-    while not _STOP:
-        t, o, s = scan_once()
+    """调度线程: 启动时按 RUN_ON_START 决定是否自动扫; 之后仅在用户配置了
+    cron / interval 时才定时扫, 否则待命等手动触发(配置保存会唤醒重读)"""
+    if CFG["run_on_start"]:
+        log("RUN_ON_START=1, 启动时先扫描一轮")
+        t, o, s = scan_once("启动")
         log("本轮结束: 尝试 %d / 成功 %d / 跳过(已存在) %d" % (t, o, s))
         if RUN_ONCE:
             log("RUN_ONCE=1, 退出")
             os._exit(0)
-        if _STOP:
-            break
+    else:
+        log("未开启启动自动扫描, 待命中(点「立即扫描一次」开始干活)")
+    while not _STOP:
+        # 读当前调度配置
+        cron = None
+        if CFG["cron"]:
+            try:
+                cron = Cron(CFG["cron"])
+            except Exception as e:
+                log("CRON 解析失败(%r), 本次不定时" % e)
         if cron:
             nxt = cron.next_after(datetime.now())
             if nxt is None:
-                log("cron 无法解析出下一次触发时间, 退回 INTERVAL 循环")
+                log("cron 无法解析出下一次触发时间, 停止定时")
                 cron = None
             else:
                 STATE["next_run"] = nxt.strftime("%Y-%m-%d %H:%M")
                 wait = max((nxt - datetime.now()).total_seconds(), 0) + 1
                 log("下次扫描: %s (还有 %.0f 秒)" % (STATE["next_run"], wait))
                 _sleep_interruptible(wait)
+        elif CFG["interval"] > 0:
+            STATE["next_run"] = "%.0f 秒后" % CFG["interval"]
+            log("下次扫描: %s" % STATE["next_run"])
+            _sleep_interruptible(CFG["interval"])
         else:
-            STATE["next_run"] = "%.0f 秒后" % INTERVAL
-            _sleep_interruptible(INTERVAL)
+            STATE["next_run"] = "仅手动触发"
+            _cfg_changed.wait(timeout=3600)   # 无自动调度, 等配置变更或退出
+            _cfg_changed.clear()
+            continue
+        if _STOP:
+            break
+        t, o, s = scan_once("定时")
+        log("本轮结束: 尝试 %d / 成功 %d / 跳过(已存在) %d" % (t, o, s))
+        if RUN_ONCE:
+            log("RUN_ONCE=1, 退出")
+            os._exit(0)
 
 
 def _sleep_interruptible(seconds):
     end = time.time() + seconds
     while not _STOP and time.time() < end:
-        time.sleep(min(5, max(end - time.time(), 0.1)))
+        if _cfg_changed.wait(timeout=min(5, max(end - time.time(), 0.1))):
+            _cfg_changed.clear()
+            return                      # 配置已改, 立即重读调度
 
 
 # ---------------- Web 前端 ----------------
@@ -367,6 +519,19 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none}
 .tag{display:inline-block;font-size:11px;padding:2px 9px;border-radius:999px;font-weight:700}
 .tag.run{background:rgba(34,197,94,.15);color:#16a34a}
 .tag.idle{background:rgba(148,163,184,.18);color:var(--faint)}
+.frm{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px 18px}
+.fld{display:flex;flex-direction:column;gap:5px;font-size:12px}
+.fld.wide{grid-column:1/-1}
+.fld label{color:var(--sub);font-weight:700}
+.fld input,.fld select,.fld textarea{background:var(--bg2);color:var(--ink);border:1px solid rgba(0,0,0,.12);
+  border-radius:8px;padding:8px 10px;font-size:13px;font-family:inherit;width:100%;transition:border-color .2s}
+html[data-theme="dark"] .fld input,html[data-theme="dark"] .fld select,html[data-theme="dark"] .fld textarea{border-color:rgba(255,255,255,.14)}
+.fld input:focus,.fld select:focus,.fld textarea:focus{outline:none;border-color:var(--green)}
+.fld textarea{resize:vertical;min-height:58px;line-height:1.5}
+.fld .hint{color:var(--faint);font-size:11px}
+.savebar{display:flex;align-items:center;gap:12px;margin-top:14px}
+.savebar .msg{font-size:12px;font-weight:700;color:#16a34a}
+.savebar .msg.err{color:#ef4444}
 </style>
 </head>
 <body>
@@ -405,8 +570,60 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none}
   </div>
 
   <div class="card">
-    <h2>当前配置</h2>
-    <div class="grid" id="cfg"></div>
+    <h2>配置(保存后写入 /data/config.json, 重启不丢失)</h2>
+    <div class="frm">
+      <div class="fld wide">
+        <label>扫描目录(每行一个, 容器内路径)</label>
+        <textarea id="f-scan" spellcheck="false"></textarea>
+      </div>
+      <div class="fld wide">
+        <label>排除目录(每行一个, 可留空)</label>
+        <textarea id="f-excl" spellcheck="false"></textarea>
+      </div>
+      <div class="fld">
+        <label>截取时间点</label>
+        <input id="f-timeline" placeholder="00:03:01" spellcheck="false">
+      </div>
+      <div class="fld">
+        <label>缩略图后缀</label>
+        <input id="f-suffix" placeholder="-thumb.jpg" spellcheck="false">
+      </div>
+      <div class="fld">
+        <label>覆盖生成</label>
+        <select id="f-overwrite">
+          <option value="0">关(只补缺失)</option>
+          <option value="1">开(全部重新生成)</option>
+        </select>
+      </div>
+      <div class="fld">
+        <label>生成策略(每 N 个暂停 M 秒)</label>
+        <input id="f-strategy" placeholder="100=60" spellcheck="false">
+      </div>
+      <div class="fld">
+        <label>定时 cron(5 段: 分 时 日 月 周)</label>
+        <input id="f-cron" placeholder="留空 = 不自动定时" spellcheck="false">
+        <span class="hint">例 30 4 * * * = 每天 04:30(容器内 UTC)</span>
+      </div>
+      <div class="fld">
+        <label>循环间隔(秒, 0 = 不循环)</label>
+        <input id="f-interval" type="number" min="0" step="60">
+      </div>
+      <div class="fld">
+        <label>启动时自动扫描</label>
+        <select id="f-runstart">
+          <option value="0">关(只手动点扫描)</option>
+          <option value="1">开(容器启动先扫一轮)</option>
+        </select>
+      </div>
+      <div class="fld">
+        <label>单文件超时(秒)</label>
+        <input id="f-timeout" type="number" min="10" max="3600" step="10">
+      </div>
+    </div>
+    <div class="savebar">
+      <button id="btn-save" onclick="saveConfig()">💾 保存配置</button>
+      <span class="msg" id="save-msg"></span>
+    </div>
   </div>
 
   <div class="card">
@@ -444,14 +661,15 @@ async function refresh(){
     document.getElementById('t-last').textContent=d.last_stats?
       ('尝试 '+d.last_stats.tried+' / 成功 '+d.last_stats.ok+' / 跳过 '+d.last_stats.skipped):'-';
     const c=d.config;
-    document.getElementById('cfg').innerHTML=[
-      ['扫描目录',(c.scan_paths||[]).join(' , ')||'-'],
-      ['排除目录',(c.exclude_paths||[]).join(' , ')||'-'],
-      ['截取时间点',c.timeline],['缩略图后缀',c.suffix],
-      ['覆盖生成',c.overwrite?'开':'关(只补缺失)'],
-      ['生成策略',c.gen_strategy],['定时',c.cron],
-      ['单文件超时',c.timeout+' s'],['前端端口',c.web_port||'已关闭']
-    ].map(x=>'<div class="kv"><span>'+esc(x[0])+'</span><b>'+esc(x[1])+'</b></div>').join('');
+    // 填充配置表单(跳过用户正在编辑的框, 避免输入被打断)
+    const F=(id,v)=>{const el=document.getElementById(id);
+      if(el&&document.activeElement!==el)el.value=v;};
+    F('f-scan',(c.scan_paths||[]).join('\n'));
+    F('f-excl',(c.exclude_paths||[]).join('\n'));
+    F('f-timeline',c.timeline);F('f-suffix',c.suffix);
+    F('f-overwrite',c.overwrite?'1':'0');F('f-strategy',c.gen_strategy);
+    F('f-cron',c.cron||'');F('f-interval',c.interval);
+    F('f-runstart',c.run_on_start?'1':'0');F('f-timeout',c.timeout);
     const box=document.getElementById('logs');
     const atBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-30;
     box.textContent=(d.logs||[]).join('\\n')||'(暂无日志)';
@@ -465,6 +683,31 @@ async function runNow(){
 }
 async function stopScan(){
   await fetch('/api/stop',{method:'POST'}); setTimeout(refresh,300);
+}
+async function saveConfig(){
+  const msg=document.getElementById('save-msg');
+  const btn=document.getElementById('btn-save');
+  const body={
+    scan_paths:document.getElementById('f-scan').value,
+    exclude_paths:document.getElementById('f-excl').value,
+    timeline:document.getElementById('f-timeline').value,
+    suffix:document.getElementById('f-suffix').value,
+    overwrite:document.getElementById('f-overwrite').value,
+    gen_strategy:document.getElementById('f-strategy').value,
+    cron:document.getElementById('f-cron').value,
+    interval:document.getElementById('f-interval').value,
+    run_on_start:document.getElementById('f-runstart').value,
+    timeout:document.getElementById('f-timeout').value
+  };
+  btn.disabled=true; msg.className='msg'; msg.textContent='保存中…';
+  try{
+    const r=await fetch('/api/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(d.ok){msg.textContent='✓ 已保存, 下次扫描生效'; setTimeout(()=>msg.textContent='',2500);}
+    else{msg.className='msg err'; msg.textContent='✕ '+(d.error||'保存失败'); setTimeout(()=>msg.className='msg',3000);}
+  }catch(e){msg.className='msg err'; msg.textContent='✕ 网络错误';}
+  btn.disabled=false; setTimeout(refresh,200);
 }
 refresh(); setInterval(refresh,3000);
 </script>
@@ -519,6 +762,22 @@ class Handler(BaseHTTPRequestHandler):
             global _STOP_SCAN
             _STOP_SCAN = True
             self._send(200, '{"ok":true}')
+        elif self.path == "/api/config":
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                new = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                self._send(400, '{"error":"请求体不是合法 JSON"}')
+                return
+            if STATE["scanning"]:
+                self._send(409, '{"error":"正在扫描中, 请先停止或等本轮结束再保存配置"}')
+                return
+            ok, msg = save_config(new)
+            if ok:
+                self._send(200, json.dumps({"ok": True, "message": msg,
+                                            "config": config_snapshot()}))
+            else:
+                self._send(400, json.dumps({"error": msg}, ensure_ascii=False))
         else:
             self._send(404, '{"error":"not found"}')
 
@@ -534,14 +793,24 @@ def main():
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
 
+    ok, err = load_config_file()
     log("=" * 56)
     log("STRM 缩略图生成器启动")
-    log("  扫描目录   : %s" % (SCAN_PATHS or "(空)"))
-    log("  排除目录   : %s" % (EXCLUDE_PATHS or "(无)"))
-    log("  截取时间点 : %s" % TIMELINE)
-    log("  覆盖生成   : %s" % ("开" if OVERWRITE else "关(只补缺失)"))
-    log("  生成策略   : %s" % GEN_STRATEGY)
-    log("  定时       : %s" % (CRON if CRON else "每 %d 秒" % INTERVAL))
+    log("  配置来源   : %s" % CFG_SOURCE)
+    if not ok:
+        log("  ⚠ 配置文件读取失败(%s), 已回退环境变量配置" % err)
+    log("  扫描目录   : %s" % (CFG["scan_paths"] or "(空)"))
+    log("  排除目录   : %s" % (CFG["exclude_paths"] or "(无)"))
+    log("  截取时间点 : %s" % CFG["timeline"])
+    log("  覆盖生成   : %s" % ("开" if CFG["overwrite"] else "关(只补缺失)"))
+    log("  生成策略   : %s" % CFG["gen_strategy"])
+    if CFG["cron"]:
+        log("  定时       : cron %s (容器内 UTC)" % CFG["cron"])
+    elif CFG["interval"] > 0:
+        log("  定时       : 每 %d 秒" % CFG["interval"])
+    else:
+        log("  定时       : 无(仅手动触发)")
+    log("  启动扫描   : %s" % ("开(启动即扫一轮)" if CFG["run_on_start"] else "关(手动点扫描才开始)"))
     log("  前端       : %s" % ("http://0.0.0.0:%d" % WEB_PORT if WEB_ENABLED else "关闭"))
     log("=" * 56)
 
