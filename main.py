@@ -21,6 +21,8 @@ v1.0.8: 支持自定义 ffmpeg 请求头(FFMPEG_HEADERS 环境变量或 Web 上�
 ffmpeg 失败时日志带退出码 + 源地址 + 完整错误输出, 方便定位真实原因。
 v1.0.9: ffmpeg 失败但看不到原因时(退出码0无产出 / stderr 为空), 自动用
 debug 级重跑一次并输出关键诊断行(http 重定向/流信息/为什么放弃)。
+v1.0.10: 截取时间点超过视频时长时(ffmpeg 安静失败: 退出码0零输出), 自动
+改取首帧兜底保证出图; 目录选择器支持按名称/修改时间排序。
 """
 import json
 import os
@@ -235,7 +237,9 @@ def browse_dir(path):
         for entry in sorted(p.iterdir(), key=lambda e: e.name.lower()):
             try:
                 if entry.is_dir() and not entry.is_symlink():
-                    dirs.append(entry.name)
+                    # name + mtime: 前端可自行按名称/时间排序(v1.0.10)
+                    dirs.append({"name": entry.name,
+                                 "mtime": int(entry.stat().st_mtime)})
             except Exception:
                 continue
             if len(dirs) >= 500:
@@ -262,13 +266,16 @@ def read_strm(path):
 
 
 def _build_ffmpeg_cmd(strm_path, thumb_path, timeline, loglevel="error"):
-    """组装 ffmpeg 命令行; 配置了 ffmpeg_headers 时加 -headers(CRLF 分隔, ffmpeg 要求)"""
+    """组装 ffmpeg 命令行; timeline=None 表示取首帧(不 seek, 最保底);
+    配置了 ffmpeg_headers 时加 -headers(CRLF 分隔, ffmpeg 要求)"""
     cmd = [FFMPEG, "-hide_banner", "-loglevel", loglevel]
     hdrs = (CFG.get("ffmpeg_headers") or "").strip()
     if hdrs:
         hdrs = "\r\n".join(l.strip() for l in hdrs.splitlines() if l.strip())
         cmd += ["-headers", hdrs]
-    cmd += ["-ss", timeline, "-i", strm_path,
+    if timeline:
+        cmd += ["-ss", timeline]
+    cmd += ["-i", strm_path,
             "-vframes", "1", "-f", "image2", "-y", thumb_path]
     return cmd
 
@@ -289,45 +296,88 @@ def _filter_debug_lines(stderr):
     return lines[:40]
 
 
-def gen_thumb(strm_path, thumb_path, timeline):
-    """ffmpeg 截帧; 成功返回 True。
-    strm_path 实为 strm 文件里指向的视频 URL(可能是 http(s) 网盘直链)。"""
-    cmd = _build_ffmpeg_cmd(strm_path, thumb_path, timeline)
+def _run_ffmpeg(cmd, thumb_path):
+    """跑一次 ffmpeg; 返回 (returncode, stderr, 是否产出有效图片)。
+    超时/执行异常时 returncode=None。"""
     try:
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            text=True, timeout=CFG["timeout"])
-        if r.returncode == 0 and os.path.exists(thumb_path) and \
-                os.path.getsize(thumb_path) > 0:
-            return True
-        # 失败: 退出码/源地址/完整错误一起记, 否则只看得到空错误啥都定位不了
-        err = (r.stderr or "").strip().replace("\r", "")
-        tail = " | ".join([l for l in err.split("\n") if l.strip()][-3:])[:500]
-        if r.returncode == 0:
-            log("ffmpeg 退出码0但未产出文件: %s | 源地址: %s | 输出: %s"
-                % (os.path.basename(strm_path), strm_path, tail or "(空)"))
-        elif r.returncode < 0:
-            log("ffmpeg 被信号 %d 杀死(可能内存不足/OOM): %s | 源地址: %s | 输出: %s"
-                % (-r.returncode, os.path.basename(strm_path), strm_path, tail or "(空)"))
-        else:
-            log("ffmpeg 失败(退出码 %d): %s | 源地址: %s | 输出: %s"
-                % (r.returncode, os.path.basename(strm_path), strm_path, tail or "(空)"))
-        # 信息不足时(退出码0无产出 / stderr 为空): 用 debug 级重跑一次, 抓关键诊断行。
-        # 典型场景: 网盘直链对 ffmpeg 返回空/提前关流, http 层认为"正常结束"于是安静退出。
-        if r.returncode == 0 or not err:
-            _diag_rerun(strm_path, thumb_path, timeline)
-        return False
+        ok = (r.returncode == 0 and os.path.exists(thumb_path)
+              and os.path.getsize(thumb_path) > 0)
+        return r.returncode, (r.stderr or ""), ok
     except subprocess.TimeoutExpired:
-        log("ffmpeg 超时(%ss): %s" % (CFG["timeout"], strm_path))
-    except FileNotFoundError:
-        log("找不到 %s, 请确认镜像内已安装 ffmpeg" % FFMPEG)
+        return None, "", False
     except Exception as e:
-        log("ffmpeg 异常: %r" % e)
+        return None, repr(e), False
+
+
+def gen_thumb(strm_path, thumb_path, timeline):
+    """ffmpeg 截帧; 成功返回 True。
+    strm_path 实为 strm 文件里指向的视频 URL(可能是 http(s) 网盘直链)。
+
+    v1.0.10 截取策略:
+    1) 先按设定的时间点(timeline) seek 截取;
+    2) 若 seek「安静失败」(退出码0但没产出, stderr 为空——最典型的原因是时间点
+       超过了视频时长: ffmpeg seek 到片尾, 解出的帧时间都早于目标被丢弃, 于是零
+       输出也不报错), 自动改取首帧重试;
+    3) 本轮连续 3 次 seek 安静失败后, 后续文件直接取首帧, 不再浪费请求;
+    4) 取首帧也失败且看不到原因时, debug 级诊断一次(每轮仅一次, 防日志刷屏)。"""
+    base = os.path.basename(strm_path)
+    rc, err = None, ""
+    how = "seek %s" % (timeline or "(未设)")
+
+    # 第 1 次: 按时间点 seek(本轮已连续失败则跳过, 不再浪费请求)
+    if timeline and STATE.get("seek_miss", 0) < 3:
+        rc, err, ok = _run_ffmpeg(
+            _build_ffmpeg_cmd(strm_path, thumb_path, timeline), thumb_path)
+        if ok:
+            STATE["seek_miss"] = 0
+            return True
+        if rc == 0 and not (err or "").strip():
+            # 安静失败: 时间点超过片长 / 直链不支持定位。改取首帧兜底。
+            STATE["seek_miss"] = STATE.get("seek_miss", 0) + 1
+            rc2, err2, ok2 = _run_ffmpeg(
+                _build_ffmpeg_cmd(strm_path, thumb_path, None), thumb_path)
+            if ok2:
+                log("时间点 %s 截取无结果(退出码0零输出: 多半是该点超过了本片时长, "
+                    "或直链不支持中途定位), 已自动改取首帧: %s" % (timeline, base))
+                return True
+            rc, err = rc2, err2
+            how = "seek %s + 取首帧" % timeline
+    else:
+        # 时间点为空, 或本轮 seek 已连续失败: 直接取首帧
+        rc, err, ok = _run_ffmpeg(
+            _build_ffmpeg_cmd(strm_path, thumb_path, None), thumb_path)
+        if ok:
+            return True
+        how = "取首帧"
+
+    # ---- 两次都失败: 记一条能定位问题的日志 ----
+    err = (err or "").strip().replace("\r", "")
+    tail = " | ".join([l for l in err.split("\n") if l.strip()][-3:])[:500]
+    if rc is None:
+        log("ffmpeg 执行异常(%s): %s | 源地址: %s | %s"
+            % (how, base, strm_path, (err or "")[:150] or "(无输出)"))
+    elif rc == 0:
+        log("ffmpeg 退出码0但未产出文件(%s): %s | 源地址: %s | 输出: %s"
+            % (how, base, strm_path, tail or "(空)"))
+    elif rc < 0:
+        log("ffmpeg 被信号 %d 杀死(可能内存不足/OOM, %s): %s | 源地址: %s | 输出: %s"
+            % (-rc, how, base, strm_path, tail or "(空)"))
+    else:
+        log("ffmpeg 失败(退出码 %d, %s): %s | 源地址: %s | 输出: %s"
+            % (rc, how, base, strm_path, tail or "(空)"))
+    # 看不到原因(退出码0无产出 / stderr 为空)时 debug 诊断一次(每轮仅一次)
+    if (rc == 0 or not err) and not STATE.get("diag_done"):
+        STATE["diag_done"] = True
+        _diag_rerun(strm_path, thumb_path, None)
     return False
 
 
 def _diag_rerun(strm_path, thumb_path, timeline):
-    """失败且看不到原因时, 用 debug 级重跑一次并把关键行写进日志(仅失败文件触发)"""
-    log("诊断: 首次失败且无有效错误输出, 用 debug 级重跑一次定位(仅此文件, 不影响其他)")
+    """失败且看不到原因时, 用 debug 级重跑一次并把关键行写进日志。
+    v1.0.10: 每轮扫描只对第一个「查不出原因」的失败文件触发, 避免日志被刷屏。"""
+    log("诊断: 失败且无有效错误输出, 用 debug 级重跑一次定位(本轮仅此一次)")
     try:
         dbg = _build_ffmpeg_cmd(strm_path, thumb_path, timeline, "debug")
         r2 = subprocess.run(dbg, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -359,7 +409,8 @@ def scan_once(source="手动"):
     tried = ok = skipped = 0
     batch = 0                                    # 距上次批量休息已处理的文件数
     STATE.update(scanning=True, scan_source=source, cur_path="", cur_file="",
-                 processed=0, last_start=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                 processed=0, last_start=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                 seek_miss=0, diag_done=False)   # v1.0.10: 每轮重置 seek 连击与诊断标记
     log("本轮限速: 每文件间隔 %ds, 每 %d 个休息 %ds"
         % (file_delay, batch_size, batch_rest))
     try:
@@ -425,7 +476,7 @@ def _sleep_stoppable(seconds):
 
 # ---------------- Web 前端 ----------------
 
-VERSION = "1.0.9"       # 显示在页面标题旁, 便于确认容器跑的是哪版代码
+VERSION = "1.0.10"      # 显示在页面标题旁, 便于确认容器跑的是哪版代码
 
 PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -496,6 +547,13 @@ html[data-theme="dark"] .fld input,html[data-theme="dark"] .fld select,html[data
 .dirpanel{margin-top:8px;border:1px solid rgba(0,0,0,.12);border-radius:10px;
   background:var(--bg2);overflow:hidden}
 html[data-theme="dark"] .dirpanel{border-color:rgba(255,255,255,.14)}
+.dirsort{display:flex;align-items:center;gap:6px;padding:6px 10px 2px;font-size:12px;
+  color:var(--sub);flex-wrap:wrap}
+.dirsort .sortbtn{padding:2px 9px;font-size:12px;border-radius:6px;border:none;
+  color:#fff;cursor:pointer;opacity:.55}
+.dirsort .sortbtn:hover{opacity:.8}
+.dirsort .sortbtn.on{opacity:1;box-shadow:0 0 0 2px var(--card),0 0 0 4px var(--green)}
+.ditem .dtime{margin-left:auto;flex:none;font-size:11px;color:var(--faint);padding-left:8px}
 .dirlist{max-height:260px;overflow:auto;padding:4px}
 .ditem{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:7px;font-size:13px}
 .ditem:hover{background:var(--track)}
@@ -573,6 +631,12 @@ html[data-theme="dark"] .sellist .selitem{color:#4ade80}
         <div class="sellist" id="f-sellist"></div>
         <div class="dirpanel" id="f-dirpanel" hidden>
           <div class="crumbs" id="f-crumbs"></div>
+          <div class="dirsort">
+            <span>排序</span>
+            <button type="button" class="gray sortbtn" data-sort="name">按名称</button>
+            <button type="button" class="gray sortbtn" data-sort="mtime_desc">时间新→旧</button>
+            <button type="button" class="gray sortbtn" data-sort="mtime_asc">时间旧→新</button>
+          </div>
           <div class="dirlist" id="f-dirlist"></div>
         </div>
         <span class="hint">点目录名自动进入下一层; 勾上前面的方块 = 确认扫描该目录(含其中的全部 .strm); 首次打开自动停在上次保存的扫描目录; 下面列表里点 ✕ 可移除已选目录</span>
@@ -580,6 +644,7 @@ html[data-theme="dark"] .sellist .selitem{color:#4ade80}
       <div class="fld">
         <label>截取时间点</label>
         <input id="f-timeline" placeholder="00:03:01" spellcheck="false">
+        <span class="hint">HH:MM:SS; 超过视频时长时自动改取首帧保证出图; 想固定取开头就填 00:00:00</span>
       </div>
       <div class="fld">
         <label>缩略图后缀</label>
@@ -659,7 +724,7 @@ function flashMsg(t,err){
   setTimeout(()=>{m.className='msg';m.textContent='';},3000);
 }
 // ---- 扫描目录选择器(浏览+勾选) ----
-let browsePath='/',scanList=[],scanDirty=false,curDirs=[],dirLoaded=false,pendingDefault=null;
+let browsePath='/',scanList=[],scanDirty=false,curDirs=[],dirLoaded=false,pendingDefault=null,dirSort='name';
 async function browseTo(p){
   browsePath=p; renderCrumbs();
   const box=document.getElementById('f-dirlist');
@@ -670,18 +735,42 @@ async function browseTo(p){
   curDirs=d.dirs||[]; dirLoaded=true;
   renderDirList();
 }
+function fmtTime(ts){
+  if(!ts)return '';
+  const d=new Date(ts*1000),p=n=>String(n).padStart(2,'0');
+  return String(d.getFullYear()).slice(2)+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+}
+// 目录排序(v1.0.10): 按名称(中文按拼音, 数字按自然数) / 时间新→旧 / 时间旧→新
+function sortedDirs(){
+  const byName=(a,b)=>a.name.localeCompare(b.name,'zh-Hans-CN',{numeric:true});
+  const a=curDirs.slice();
+  if(dirSort==='mtime_desc')a.sort((x,y)=>(y.mtime||0)-(x.mtime||0)||byName(x,y));
+  else if(dirSort==='mtime_asc')a.sort((x,y)=>(x.mtime||0)-(y.mtime||0)||byName(x,y));
+  else a.sort(byName);
+  return a;
+}
+function renderSortBar(){
+  const map={name:'f-sort-name',mtime_desc:'f-sort-mtime-desc',mtime_asc:'f-sort-mtime-asc'};
+  for(const k in map){
+    const b=document.getElementById(map[k]);
+    if(b)b.className='gray sortbtn'+(k===dirSort?' on':'');
+  }
+}
 function renderDirList(){
   if(!dirLoaded)return;
   const box=document.getElementById('f-dirlist');
-  if(!curDirs.length){ box.innerHTML='<div class="empty">(此目录下没有子目录)</div>'; return; }
-  box.innerHTML=curDirs.map(x=>{
-    const full=browsePath==='/'?'/'+x:browsePath+'/'+x;
+  if(!curDirs.length){ box.innerHTML='<div class="empty">(此目录下没有子目录)</div>'; renderSortBar(); return; }
+  const showTime=dirSort!=='name';
+  box.innerHTML=sortedDirs().map(x=>{
+    const full=browsePath==='/'?'/'+x.name:browsePath+'/'+x.name;
     const on=scanList.indexOf(full)>=0;
     return '<div class="ditem'+(on?' checked':'')+'">'+
       '<input type="checkbox" data-sel="'+esc(full)+'"'+(on?' checked':'')+' title="勾选=扫描此目录">'+
-      '<span class="dname" data-dir="'+esc(full)+'" title="点击进入">'+esc(x)+'</span>'+
+      '<span class="dname" data-dir="'+esc(full)+'" title="点击进入">'+esc(x.name)+'</span>'+
+      (showTime?'<span class="dtime" title="修改时间">'+fmtTime(x.mtime)+'</span>':'')+
       '<span class="dgo" data-dir="'+esc(full)+'" title="进入">▸</span></div>';
   }).join('');
+  renderSortBar();
 }
 function toggleScan(p,on){
   const i=scanList.indexOf(p);
@@ -824,6 +913,7 @@ _dp.addEventListener('click',function(e){
   const t=e.target;
   if(!t||!t.dataset)return;
   if(t.tagName==='INPUT')return;                       // checkbox 的点击交给 change 处理, 不当成导航
+  if(t.dataset.sort!==undefined){dirSort=t.dataset.sort;renderDirList();return;}   // 排序切换
   if(t.dataset.dir!==undefined){browseTo(t.dataset.dir);return;}   // 点目录名进入
   if(t.dataset.p!==undefined){browseTo(t.dataset.p);return;}      // 面包屑回跳
 });
