@@ -353,7 +353,7 @@ def _sleep_stoppable(seconds):
 
 # ---------------- Web 前端 ----------------
 
-VERSION = "1.0.6"       # 显示在页面标题旁, 便于确认容器跑的是哪版代码
+VERSION = "1.0.7"       # 显示在页面标题旁, 便于确认容器跑的是哪版代码
 
 PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -420,7 +420,7 @@ html[data-theme="dark"] .fld input,html[data-theme="dark"] .fld select,html[data
 .savebar .msg{font-size:12px;font-weight:700;color:#16a34a}
 .savebar .msg.err{color:#ef4444}
 .picker{display:flex;gap:8px;align-items:center}
-.picker button,.addrow button{flex:none;padding:8px 12px;font-size:12px;border-radius:8px}
+.picker button{flex:none;padding:8px 12px;font-size:12px;border-radius:8px}
 .dirpanel{margin-top:8px;border:1px solid rgba(0,0,0,.12);border-radius:10px;
   background:var(--bg2);overflow:hidden}
 html[data-theme="dark"] .dirpanel{border-color:rgba(255,255,255,.14)}
@@ -451,10 +451,6 @@ html[data-theme="dark"] .selbar .selitem{color:#4ade80}
 .crumbs span.cur{color:var(--ink);font-weight:700;cursor:default}
 .crumbs span.cur:hover{background:transparent}
 .crumbs i{color:var(--faint);font-style:normal;align-self:center}
-.addrow{display:flex;gap:8px;margin-top:8px}
-.addrow input{flex:1;background:var(--bg2);color:var(--ink);border:1px solid rgba(0,0,0,.12);
-  border-radius:8px;padding:8px 10px;font-size:13px;font-family:inherit}
-html[data-theme="dark"] .addrow input{border-color:rgba(255,255,255,.14)}
 </style>
 </head>
 <body>
@@ -508,11 +504,7 @@ html[data-theme="dark"] .addrow input{border-color:rgba(255,255,255,.14)}
           <div class="dirlist" id="f-dirlist"></div>
           <div class="selbar" id="f-selbar"></div>
         </div>
-        <div class="addrow">
-          <input id="f-manual" placeholder="或手动输入容器内路径, 如 /link/电影" spellcheck="false">
-          <button type="button" class="gray" onclick="browseAddManual()">添加</button>
-        </div>
-        <span class="hint">点目录名自动进入下一层; 勾上前面的方块 = 确认扫描该目录(含其中的全部 .strm)</span>
+        <span class="hint">点目录名自动进入下一层; 勾上前面的方块 = 确认扫描该目录(含其中的全部 .strm); 首次打开自动停在上次保存的扫描目录</span>
       </div>
       <div class="fld">
         <label>截取时间点</label>
@@ -591,7 +583,7 @@ function flashMsg(t,err){
   setTimeout(()=>{m.className='msg';m.textContent='';},3000);
 }
 // ---- 扫描目录选择器(浏览+勾选) ----
-let browsePath='/',scanList=[],scanDirty=false,curDirs=[],dirLoaded=false;
+let browsePath='/',scanList=[],scanDirty=false,curDirs=[],dirLoaded=false,pendingDefault=null;
 async function browseTo(p){
   browsePath=p; renderCrumbs();
   const box=document.getElementById('f-dirlist');
@@ -610,7 +602,7 @@ function renderDirList(){
     const full=browsePath==='/'?'/'+x:browsePath+'/'+x;
     const on=scanList.indexOf(full)>=0;
     return '<div class="ditem'+(on?' checked':'')+'">'+
-      '<input type="checkbox" data-p="'+esc(full)+'"'+(on?' checked':'')+' title="勾选=扫描此目录">'+
+      '<input type="checkbox" data-sel="'+esc(full)+'"'+(on?' checked':'')+' title="勾选=扫描此目录">'+
       '<span class="dname" data-dir="'+esc(full)+'" title="点击进入">'+esc(x)+'</span>'+
       '<span class="dgo" data-dir="'+esc(full)+'" title="进入">▸</span></div>';
   }).join('');
@@ -630,18 +622,12 @@ function renderSelBar(){
   const bar=document.getElementById('f-selbar');
   if(!bar)return;
   if(!scanList.length){
-    bar.innerHTML='<span style="color:var(--faint)">尚未选择扫描目录(勾选上面的目录, 或在下方手动输入添加)</span>';
+    bar.innerHTML='<span style="color:var(--faint)">尚未选择扫描目录(勾选上面的目录即可)</span>';
     return;
   }
   bar.innerHTML='<span>已选 '+scanList.length+' 个:</span>'+scanList.map((p,i)=>
     '<span class="selitem"><span title="'+esc(p)+'">'+esc(p)+'</span>'+
     '<b data-rm="'+i+'" title="移除">✕</b></span>').join('');
-}
-function browseAddManual(){
-  const el=document.getElementById('f-manual');
-  const v=el.value.trim(); if(!v)return;
-  if(scanList.indexOf(v)<0){scanList.push(v);scanDirty=true;renderSelBar();renderDirList();}
-  el.value='';
 }
 function toggleDirPanel(){
   const panel=document.getElementById('f-dirpanel');
@@ -650,7 +636,8 @@ function toggleDirPanel(){
   const btn=document.getElementById('f-browse-toggle');
   btn.innerHTML=(open?'▲ 收起(已选 ':'▼ 浏览目录(已选 ')+
     '<b id="f-selcount">'+scanList.length+'</b> 个)';
-  if(open&&!dirLoaded)browseTo(browsePath||'/');
+  // 首次展开: 有已保存的扫描目录就直接停在该目录(通常是媒体库根, 如 /link), 否则停根目录
+  if(open&&!dirLoaded)browseTo(pendingDefault||browsePath||'/');
 }
 function renderCrumbs(){
   const box=document.getElementById('f-crumbs');
@@ -702,7 +689,9 @@ async function refresh(){
   F('f-timeout',c.timeout);
   // 扫描目录: 用户未在本地增删时, 以后端配置为准
   if(!scanDirty && JSON.stringify(c.scan_paths||[])!==JSON.stringify(scanList)){
-    scanList=(c.scan_paths||[]).slice(); renderSelBar(); renderDirList();
+    scanList=(c.scan_paths||[]).slice();
+    if(!dirLoaded)pendingDefault=scanList[0]||null;   // 首次展开面板时停在这里
+    renderSelBar(); renderDirList();
   }
   const box=document.getElementById('logs');
   const atBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-30;
@@ -750,13 +739,14 @@ const _dp=document.getElementById('f-dirpanel');
 _dp.addEventListener('click',function(e){
   const t=e.target;
   if(!t||!t.dataset)return;
+  if(t.tagName==='INPUT')return;                       // checkbox 的点击交给 change 处理, 不当成导航
   if(t.dataset.dir!==undefined){browseTo(t.dataset.dir);return;}   // 点目录名进入
   if(t.dataset.p!==undefined){browseTo(t.dataset.p);return;}      // 面包屑回跳
   if(t.dataset.rm!==undefined){scanRemove(+t.dataset.rm);}        // 已选项移除
 });
 _dp.addEventListener('change',function(e){
   const t=e.target;
-  if(t&&t.type==='checkbox'&&t.dataset&&t.dataset.p!==undefined)toggleScan(t.dataset.p,t.checked);
+  if(t&&t.type==='checkbox'&&t.dataset&&t.dataset.sel!==undefined)toggleScan(t.dataset.sel,t.checked);
 });
 </script>
 </body>
