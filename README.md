@@ -117,6 +117,9 @@ docker compose logs -f          # 看扫描/生成日志
 - **ffmpeg 失败怎么排查**：v1.0.8 起失败日志会带**退出码 + 源地址 + 完整错误输出**，
   例如 `HTTP Error 403: Forbidden` 多半是直链要求带请求头（在 Web 上配
   `ffmpeg 请求头`，如 User-Agent/Referer），`404` 多半是链接过期，超时会单独提示。
+  v1.0.9 起，如果失败但看不到原因（退出码 0 却没有产出文件 / 错误输出为空——典型是
+  网盘直链对 ffmpeg 返回空或提前关流），会**自动用 debug 级重跑一次**并把关键诊断行
+  （HTTP 重定向链、响应码、Content-Length、流信息、为什么放弃）写进日志。
 - **权限**：缩略图是**写入**挂载目录，确保容器对该目录可写（`chown`/`chmod` 或挂载时给足权限）。
 - **配置迁移**：旧版 `/data/config.json` 里的 `cron`/`interval`/`run_on_start`/`gen_strategy`/`exclude_paths`
   字段会被自动忽略；在 Web 上保存一次配置即重写为新格式。

@@ -19,6 +19,8 @@ v1.0.5 起为纯手动模式: 没有任何定时/启动自扫/循环, 只有手�
 v1.0.8: 支持自定义 ffmpeg 请求头(FFMPEG_HEADERS 环境变量或 Web 上的
 「ffmpeg 请求头」), 网盘直链要求带 User-Agent/Referer 等头时才放行;
 ffmpeg 失败时日志带退出码 + 源地址 + 完整错误输出, 方便定位真实原因。
+v1.0.9: ffmpeg 失败但看不到原因时(退出码0无产出 / stderr 为空), 自动用
+debug 级重跑一次并输出关键诊断行(http 重定向/流信息/为什么放弃)。
 """
 import json
 import os
@@ -259,9 +261,9 @@ def read_strm(path):
     return ""
 
 
-def _build_ffmpeg_cmd(strm_path, thumb_path, timeline):
+def _build_ffmpeg_cmd(strm_path, thumb_path, timeline, loglevel="error"):
     """组装 ffmpeg 命令行; 配置了 ffmpeg_headers 时加 -headers(CRLF 分隔, ffmpeg 要求)"""
-    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error"]
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", loglevel]
     hdrs = (CFG.get("ffmpeg_headers") or "").strip()
     if hdrs:
         hdrs = "\r\n".join(l.strip() for l in hdrs.splitlines() if l.strip())
@@ -269,6 +271,22 @@ def _build_ffmpeg_cmd(strm_path, thumb_path, timeline):
     cmd += ["-ss", timeline, "-i", strm_path,
             "-vframes", "1", "-f", "image2", "-y", thumb_path]
     return cmd
+
+
+# 诊断日志过滤关键词: ffmpeg debug 级输出很长, 只留与"为什么拉流失败"相关的行
+_DIAG_KEYS = ("http", "redirect", "Stream", "frame=", "Opening", "Invalid",
+              "could not", "error", "Error", "ERROR", "trailing", "moov",
+              "seek", "Server returned", "403", "404", "Expired", "expired",
+              "unsupported", "Connection", "encoding", "Buid", "Build",
+              "Impossible", "impossible", "NULL", "empty", "End of",
+              "Protocol", "crypto", "tls", "ssl", "Certificate")
+
+
+def _filter_debug_lines(stderr):
+    """从 ffmpeg debug 输出里筛出关键诊断行(最多 40 行)"""
+    lines = [l.strip() for l in (stderr or "").splitlines()
+             if l.strip() and any(k in l for k in _DIAG_KEYS)]
+    return lines[:40]
 
 
 def gen_thumb(strm_path, thumb_path, timeline):
@@ -293,6 +311,10 @@ def gen_thumb(strm_path, thumb_path, timeline):
         else:
             log("ffmpeg 失败(退出码 %d): %s | 源地址: %s | 输出: %s"
                 % (r.returncode, os.path.basename(strm_path), strm_path, tail or "(空)"))
+        # 信息不足时(退出码0无产出 / stderr 为空): 用 debug 级重跑一次, 抓关键诊断行。
+        # 典型场景: 网盘直链对 ffmpeg 返回空/提前关流, http 层认为"正常结束"于是安静退出。
+        if r.returncode == 0 or not err:
+            _diag_rerun(strm_path, thumb_path, timeline)
         return False
     except subprocess.TimeoutExpired:
         log("ffmpeg 超时(%ss): %s" % (CFG["timeout"], strm_path))
@@ -301,6 +323,25 @@ def gen_thumb(strm_path, thumb_path, timeline):
     except Exception as e:
         log("ffmpeg 异常: %r" % e)
     return False
+
+
+def _diag_rerun(strm_path, thumb_path, timeline):
+    """失败且看不到原因时, 用 debug 级重跑一次并把关键行写进日志(仅失败文件触发)"""
+    log("诊断: 首次失败且无有效错误输出, 用 debug 级重跑一次定位(仅此文件, 不影响其他)")
+    try:
+        dbg = _build_ffmpeg_cmd(strm_path, thumb_path, timeline, "debug")
+        r2 = subprocess.run(dbg, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, timeout=CFG["timeout"])
+        diag = _filter_debug_lines(r2.stderr)
+        if diag:
+            log("诊断日志(退出码 %s, %d 行关键输出):" % (r2.returncode, len(diag)))
+            for l in diag:
+                log("  └ " + l[:220])
+        else:
+            log("诊断日志: debug 级也无任何关键输出(退出码 %s, stderr %d 字节)"
+                % (r2.returncode, len(r2.stderr or "")))
+    except Exception as e:
+        log("诊断重跑异常: %r" % e)
 
 
 def scan_once(source="手动"):
@@ -384,7 +425,7 @@ def _sleep_stoppable(seconds):
 
 # ---------------- Web 前端 ----------------
 
-VERSION = "1.0.8"       # 显示在页面标题旁, 便于确认容器跑的是哪版代码
+VERSION = "1.0.9"       # 显示在页面标题旁, 便于确认容器跑的是哪版代码
 
 PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
