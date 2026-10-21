@@ -16,6 +16,9 @@ v1.0.5 起为纯手动模式: 没有任何定时/启动自扫/循环, 只有手�
 每处理 1 个文件休息 FILE_DELAY 秒, 每 BATCH_SIZE 个再休息 BATCH_REST 秒。
 
 纯 Python 标准库, 零第三方依赖; 初始配置走环境变量, 之后以配置文件为准。
+v1.0.8: 支持自定义 ffmpeg 请求头(FFMPEG_HEADERS 环境变量或 Web 上的
+「ffmpeg 请求头」), 网盘直链要求带 User-Agent/Referer 等头时才放行;
+ffmpeg 失败时日志带退出码 + 源地址 + 完整错误输出, 方便定位真实原因。
 """
 import json
 import os
@@ -51,7 +54,8 @@ def _split_multi(v):
     return parts
 
 
-SCAN_PATHS_DEFAULT = _split_multi(_env("SCAN_PATHS", "/link"))
+# 扫描目录默认留空(v1.0.8 起): 在 Web 上浏览勾选, 或用 SCAN_PATHS 环境变量指定
+SCAN_PATHS_DEFAULT = _split_multi(_env("SCAN_PATHS", ""))
 CONFIG_PATH = _env("CONFIG_PATH", "/data/config.json")   # 配置文件路径(可挂卷持久化)
 
 # 运行时可调配置: 环境变量/默认值为初始值, 配置文件(若存在)整体覆盖, Web 保存后写回文件
@@ -64,6 +68,7 @@ CFG = {
     "batch_size": int(_env("BATCH_SIZE", "30")),         # 每处理 N 个文件后进入批量休息
     "batch_rest": int(_env("BATCH_REST", "60")),         # 批量休息时长(秒), 防风控
     "timeout": int(_env("TIMEOUT", "300")),              # 单个文件 ffmpeg 超时(秒)
+    "ffmpeg_headers": _env("FFMPEG_HEADERS", ""),        # ffmpeg 额外请求头, 每行一个「名称: 值」
 }
 CFG_SOURCE = "环境变量/默认值"      # 当前配置来源(启动日志用)
 
@@ -75,7 +80,7 @@ WEB_ENABLED = _env_bool("WEB_ENABLED", "1")                     # 0=关掉前端
 # 注意: v1.0.5 起为纯手动模式, 不再有任何定时/自动扫描相关配置; v1.0.6 起移除排除目录
 EDITABLE = ("scan_paths", "timeline", "suffix",
             "overwrite", "file_delay", "batch_size", "batch_rest",
-            "timeout")
+            "timeout", "ffmpeg_headers")
 
 _STOP = False                # 退出进程
 _STOP_SCAN = False           # 停止当前扫描轮
@@ -154,6 +159,7 @@ def load_config_file():
         merged["timeout"] = max(_as_int(merged["timeout"], 300), 10)
         merged["timeline"] = str(merged["timeline"]).strip()
         merged["suffix"] = str(merged["suffix"]).strip()
+        merged["ffmpeg_headers"] = str(merged["ffmpeg_headers"]).strip()
         merged["file_delay"] = min(max(_as_int(merged["file_delay"], 5), 0), 600)
         merged["batch_size"] = min(max(_as_int(merged["batch_size"], 30), 1), 1000)
         merged["batch_rest"] = min(max(_as_int(merged["batch_rest"], 60), 0), 3600)
@@ -188,6 +194,10 @@ def validate_config(new):
     out["batch_size"] = min(max(_as_int(new.get("batch_size"), 30), 1), 1000)
     out["batch_rest"] = min(max(_as_int(new.get("batch_rest"), 60), 0), 3600)
     out["timeout"] = min(max(_as_int(new.get("timeout"), 300), 10), 3600)
+    hdrs = str(new.get("ffmpeg_headers", "")).strip()
+    if len(hdrs) > 4000:
+        return None, "请求头内容过长(上限 4000 字符)"
+    out["ffmpeg_headers"] = hdrs
     return out, None
 
 
@@ -249,19 +259,40 @@ def read_strm(path):
     return ""
 
 
+def _build_ffmpeg_cmd(strm_path, thumb_path, timeline):
+    """组装 ffmpeg 命令行; 配置了 ffmpeg_headers 时加 -headers(CRLF 分隔, ffmpeg 要求)"""
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error"]
+    hdrs = (CFG.get("ffmpeg_headers") or "").strip()
+    if hdrs:
+        hdrs = "\r\n".join(l.strip() for l in hdrs.splitlines() if l.strip())
+        cmd += ["-headers", hdrs]
+    cmd += ["-ss", timeline, "-i", strm_path,
+            "-vframes", "1", "-f", "image2", "-y", thumb_path]
+    return cmd
+
+
 def gen_thumb(strm_path, thumb_path, timeline):
-    """ffmpeg 截帧; 成功返回 True"""
-    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error",
-           "-ss", timeline, "-i", strm_path,
-           "-vframes", "1", "-f", "image2", "-y", thumb_path]
+    """ffmpeg 截帧; 成功返回 True。
+    strm_path 实为 strm 文件里指向的视频 URL(可能是 http(s) 网盘直链)。"""
+    cmd = _build_ffmpeg_cmd(strm_path, thumb_path, timeline)
     try:
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            text=True, timeout=CFG["timeout"])
         if r.returncode == 0 and os.path.exists(thumb_path) and \
                 os.path.getsize(thumb_path) > 0:
             return True
-        log("ffmpeg 失败(%s): %s" % (os.path.basename(strm_path),
-                                     (r.stderr or "").strip().split("\n")[-1][:200]))
+        # 失败: 退出码/源地址/完整错误一起记, 否则只看得到空错误啥都定位不了
+        err = (r.stderr or "").strip().replace("\r", "")
+        tail = " | ".join([l for l in err.split("\n") if l.strip()][-3:])[:500]
+        if r.returncode == 0:
+            log("ffmpeg 退出码0但未产出文件: %s | 源地址: %s | 输出: %s"
+                % (os.path.basename(strm_path), strm_path, tail or "(空)"))
+        elif r.returncode < 0:
+            log("ffmpeg 被信号 %d 杀死(可能内存不足/OOM): %s | 源地址: %s | 输出: %s"
+                % (-r.returncode, os.path.basename(strm_path), strm_path, tail or "(空)"))
+        else:
+            log("ffmpeg 失败(退出码 %d): %s | 源地址: %s | 输出: %s"
+                % (r.returncode, os.path.basename(strm_path), strm_path, tail or "(空)"))
         return False
     except subprocess.TimeoutExpired:
         log("ffmpeg 超时(%ss): %s" % (CFG["timeout"], strm_path))
@@ -353,7 +384,7 @@ def _sleep_stoppable(seconds):
 
 # ---------------- Web 前端 ----------------
 
-VERSION = "1.0.7"       # 显示在页面标题旁, 便于确认容器跑的是哪版代码
+VERSION = "1.0.8"       # 显示在页面标题旁, 便于确认容器跑的是哪版代码
 
 PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -435,16 +466,15 @@ html[data-theme="dark"] .dirpanel{border-color:rgba(255,255,255,.14)}
 .ditem.checked .dname{font-weight:700;color:#15803d}
 html[data-theme="dark"] .ditem.checked .dname{color:#4ade80}
 .dirlist .empty{padding:10px;font-size:12px;color:var(--faint);text-align:center}
-.selbar{border-top:1px dashed rgba(0,0,0,.12);padding:8px 10px;font-size:12px;color:var(--sub);
-  display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center}
-html[data-theme="dark"] .selbar{border-color:rgba(255,255,255,.14)}
-.selbar .selitem{display:inline-flex;align-items:center;gap:4px;background:rgba(34,197,94,.12);
+.sellist{margin-top:8px;display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;
+  font-size:12px;color:var(--sub)}
+.sellist .selitem{display:inline-flex;align-items:center;gap:4px;background:rgba(34,197,94,.12);
   border:1px solid rgba(34,197,94,.35);color:#15803d;border-radius:999px;
   padding:2px 6px 2px 10px;font-weight:700;max-width:100%}
-html[data-theme="dark"] .selbar .selitem{color:#4ade80}
-.selbar .selitem span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px}
-.selbar .selitem b{cursor:pointer;opacity:.6;padding:0 2px}
-.selbar .selitem b:hover{opacity:1}
+html[data-theme="dark"] .sellist .selitem{color:#4ade80}
+.sellist .selitem span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px}
+.sellist .selitem b{cursor:pointer;opacity:.6;padding:0 2px}
+.sellist .selitem b:hover{opacity:1}
 .crumbs{display:flex;flex-wrap:wrap;gap:4px;margin:8px 8px 0;font-size:12px;color:var(--sub)}
 .crumbs span{cursor:pointer;padding:2px 6px;border-radius:6px}
 .crumbs span:hover{background:var(--track);color:var(--ink)}
@@ -499,12 +529,12 @@ html[data-theme="dark"] .selbar .selitem{color:#4ade80}
         <div class="picker">
           <button type="button" class="gray" id="f-browse-toggle" onclick="toggleDirPanel()">▼ 浏览目录(已选 <b id="f-selcount">0</b> 个)</button>
         </div>
+        <div class="sellist" id="f-sellist"></div>
         <div class="dirpanel" id="f-dirpanel" hidden>
           <div class="crumbs" id="f-crumbs"></div>
           <div class="dirlist" id="f-dirlist"></div>
-          <div class="selbar" id="f-selbar"></div>
         </div>
-        <span class="hint">点目录名自动进入下一层; 勾上前面的方块 = 确认扫描该目录(含其中的全部 .strm); 首次打开自动停在上次保存的扫描目录</span>
+        <span class="hint">点目录名自动进入下一层; 勾上前面的方块 = 确认扫描该目录(含其中的全部 .strm); 首次打开自动停在上次保存的扫描目录; 下面列表里点 ✕ 可移除已选目录</span>
       </div>
       <div class="fld">
         <label>截取时间点</label>
@@ -539,6 +569,11 @@ html[data-theme="dark"] .selbar .selitem{color:#4ade80}
       <div class="fld">
         <label>单文件超时(秒)</label>
         <input id="f-timeout" type="number" min="10" max="3600" step="10">
+      </div>
+      <div class="fld wide">
+        <label>ffmpeg 请求头(可选)</label>
+        <textarea id="f-headers" rows="3" spellcheck="false" placeholder="User-Agent: Mozilla/5.0&#10;Referer: https://115.com/"></textarea>
+        <span class="hint">每行一个「名称: 值」(如 User-Agent / Referer / Cookie); 网盘直链要求带头才放行时填写, 留空 = 不带额外请求头</span>
       </div>
     </div>
     <div class="savebar">
@@ -611,21 +646,22 @@ function toggleScan(p,on){
   const i=scanList.indexOf(p);
   if(on&&i<0){scanList.push(p);scanDirty=true;}
   if(!on&&i>=0){scanList.splice(i,1);scanDirty=true;}
-  renderSelBar(); renderDirList();
+  renderSelList(); renderDirList();
 }
 function scanRemove(i){
-  if(i>=0&&i<scanList.length){scanList.splice(i,1);scanDirty=true;renderSelBar();renderDirList();}
+  if(i>=0&&i<scanList.length){scanList.splice(i,1);scanDirty=true;renderSelList();renderDirList();}
 }
-function renderSelBar(){
+// 已选目录列表: 常驻在「浏览目录」按钮下方, 收起面板也能看到/移除
+function renderSelList(){
   const sc=document.getElementById('f-selcount');
   if(sc)sc.textContent=scanList.length;
-  const bar=document.getElementById('f-selbar');
-  if(!bar)return;
+  const box=document.getElementById('f-sellist');
+  if(!box)return;
   if(!scanList.length){
-    bar.innerHTML='<span style="color:var(--faint)">尚未选择扫描目录(勾选上面的目录即可)</span>';
+    box.innerHTML='<span style="color:var(--faint)">尚未选择扫描目录(点上方「浏览目录」展开面板, 勾选要扫描的目录)</span>';
     return;
   }
-  bar.innerHTML='<span>已选 '+scanList.length+' 个:</span>'+scanList.map((p,i)=>
+  box.innerHTML='<span>已选 '+scanList.length+' 个:</span>'+scanList.map((p,i)=>
     '<span class="selitem"><span title="'+esc(p)+'">'+esc(p)+'</span>'+
     '<b data-rm="'+i+'" title="移除">✕</b></span>').join('');
 }
@@ -686,12 +722,12 @@ async function refresh(){
   F('f-timeline',c.timeline);F('f-suffix',c.suffix);
   F('f-overwrite',c.overwrite?'1':'0');
   F('f-filedelay',c.file_delay);F('f-batchsize',c.batch_size);F('f-batchrest',c.batch_rest);
-  F('f-timeout',c.timeout);
+  F('f-timeout',c.timeout);F('f-headers',c.ffmpeg_headers||'');
   // 扫描目录: 用户未在本地增删时, 以后端配置为准
   if(!scanDirty && JSON.stringify(c.scan_paths||[])!==JSON.stringify(scanList)){
     scanList=(c.scan_paths||[]).slice();
     if(!dirLoaded)pendingDefault=scanList[0]||null;   // 首次展开面板时停在这里
-    renderSelBar(); renderDirList();
+    renderSelList(); renderDirList();
   }
   const box=document.getElementById('logs');
   const atBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-30;
@@ -720,7 +756,8 @@ async function saveConfig(){
     file_delay:document.getElementById('f-filedelay').value,
     batch_size:document.getElementById('f-batchsize').value,
     batch_rest:document.getElementById('f-batchrest').value,
-    timeout:document.getElementById('f-timeout').value
+    timeout:document.getElementById('f-timeout').value,
+    ffmpeg_headers:document.getElementById('f-headers').value
   };
   btn.disabled=true; msg.className='msg'; msg.textContent='保存中…';
   try{
@@ -733,8 +770,14 @@ async function saveConfig(){
 }
 // 状态轮询与目录选择器互相独立: 即使 /api/state 不通, 目录面板照样能用
 refresh(); setInterval(refresh,3000);
-renderSelBar();
-// 目录面板事件委托(面包屑回跳/点名字进入/勾选/移除), 避免在内嵌 JS 里拼 onclick(转义地狱)
+renderSelList();
+// 已选列表(按钮下方常驻)的移除按钮: 单独绑委托, 与面板内的委托分开
+const _sl=document.getElementById('f-sellist');
+if(_sl)_sl.addEventListener('click',function(e){
+  const t=e.target;
+  if(t&&t.dataset&&t.dataset.rm!==undefined)scanRemove(+t.dataset.rm);
+});
+// 目录面板事件委托(面包屑回跳/点名字进入/勾选), 避免在内嵌 JS 里拼 onclick(转义地狱)
 const _dp=document.getElementById('f-dirpanel');
 _dp.addEventListener('click',function(e){
   const t=e.target;
@@ -742,7 +785,6 @@ _dp.addEventListener('click',function(e){
   if(t.tagName==='INPUT')return;                       // checkbox 的点击交给 change 处理, 不当成导航
   if(t.dataset.dir!==undefined){browseTo(t.dataset.dir);return;}   // 点目录名进入
   if(t.dataset.p!==undefined){browseTo(t.dataset.p);return;}      // 面包屑回跳
-  if(t.dataset.rm!==undefined){scanRemove(+t.dataset.rm);}        // 已选项移除
 });
 _dp.addEventListener('change',function(e){
   const t=e.target;
@@ -868,6 +910,10 @@ def main():
     log("  覆盖生成   : %s" % ("开" if CFG["overwrite"] else "关(只补缺失)"))
     log("  限速       : 每文件间隔 %ds, 每 %d 个休息 %ds"
         % (CFG["file_delay"], CFG["batch_size"], CFG["batch_rest"]))
+    _hdrs = (CFG.get("ffmpeg_headers") or "").strip()
+    if _hdrs:
+        log("  ffmpeg 请求头: 已设置 %d 行"
+            % len([l for l in _hdrs.splitlines() if l.strip()]))
     log("  扫描方式   : 仅手动(点 Web 上的「立即扫描一次」才开始, 无任何定时/自动扫描)")
     # 旧版环境变量提示: 定时类 v1.0.5 起忽略, 排除目录 v1.0.6 起忽略
     _legacy = [k for k in ("CRON", "INTERVAL", "RUN_ON_START", "RUN_ONCE",

@@ -13,6 +13,9 @@
 # ★ 限速(防打爆网盘触发风控): 每处理 1 个文件休息 FILE_DELAY 秒,
 #   每 BATCH_SIZE 个再休息 BATCH_REST 秒; 默认 5s / 30 个 / 60s。
 # ★ v1.0.6 起移除排除目录(EXCLUDE_PATHS 一并忽略): 不想扫的目录不要挂载/不要勾选即可。
+# ★ v1.0.8 起 SCAN_PATHS 不再默认 /link: 扫描目录在 Web 上浏览勾选并保存,
+#   首次部署也可以用 SCAN_PATHS 指定(容器内路径, 与下面 volumes 对应)。
+#   ffmpeg 请求头(网盘直链要求带 User-Agent/Referer 时才需要)同样在 Web 上配置。
 
 services:
   strm-thumb:
@@ -22,9 +25,9 @@ services:
     ports:
       - "8081:8081"          # Web 前端端口
     environment:
-      # 扫描目录: 多个用换行(或逗号)分隔, 注意是「容器内」路径, 与下面 volumes 对应
-      # (首次部署用这里; 一旦 Web 上保存过配置, 就以 ./data/config.json 为准)
-      SCAN_PATHS: "/link"
+      # 扫描目录(可选): 多个用换行(或逗号)分隔, 注意是「容器内」路径, 与下面 volumes 对应;
+      # 不配则启动后到 Web 上浏览勾选(一旦 Web 保存过配置, 就以 ./data/config.json 为准)
+      # SCAN_PATHS: "/link"
       # 截取时间点 HH:MM:SS
       TIMELINE: "00:03:01"
       # 1=对所有文件重新生成; 0=只补缺失的(默认)
