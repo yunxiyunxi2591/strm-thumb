@@ -23,9 +23,13 @@ v1.0.9: ffmpeg 失败但看不到原因时(退出码0无产出 / stderr 为空),
 debug 级重跑一次并输出关键诊断行(http 重定向/流信息/为什么放弃)。
 v1.0.10: 截取时间点超过视频时长时(ffmpeg 安静失败: 退出码0零输出), 自动
 改取首帧兜底保证出图; 目录选择器支持按名称/修改时间排序。
+v1.0.11: 每个文件先探片长(ffprobe, 没有就退回 ffmpeg -i), 时间点超过片长
+85% 时自动改成片长的 30% 处截取, 日志写明片长——短片(1~3 分钟)不会再出现
+「退出码0零输出」; 探片长可用环境变量 PROBE_DURATION=0 关闭(每文件省一次请求)。
 """
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -77,6 +81,7 @@ CFG = {
 CFG_SOURCE = "环境变量/默认值"      # 当前配置来源(启动日志用)
 
 FFMPEG = _env("FFMPEG_BIN", "ffmpeg")                           # ffmpeg 可执行文件
+FFPROBE = _env("FFPROBE_BIN", "ffprobe")                        # ffprobe(探片长, 没有就退回 ffmpeg)
 WEB_PORT = int(_env("WEB_PORT", "8081"))                        # Web 前端端口(改端口需重启容器)
 WEB_ENABLED = _env_bool("WEB_ENABLED", "1")                     # 0=关掉前端, 只当 worker
 
@@ -265,19 +270,79 @@ def read_strm(path):
     return ""
 
 
-def _build_ffmpeg_cmd(strm_path, thumb_path, timeline, loglevel="error"):
-    """组装 ffmpeg 命令行; timeline=None 表示取首帧(不 seek, 最保底);
-    配置了 ffmpeg_headers 时加 -headers(CRLF 分隔, ffmpeg 要求)"""
-    cmd = [FFMPEG, "-hide_banner", "-loglevel", loglevel]
+def _header_args():
+    """配置了 ffmpeg_headers 时返回 -headers 参数(CRLF 分隔, ffmpeg 要求)"""
     hdrs = (CFG.get("ffmpeg_headers") or "").strip()
-    if hdrs:
-        hdrs = "\r\n".join(l.strip() for l in hdrs.splitlines() if l.strip())
-        cmd += ["-headers", hdrs]
+    if not hdrs:
+        return []
+    hdrs = "\r\n".join(l.strip() for l in hdrs.splitlines() if l.strip())
+    return ["-headers", hdrs]
+
+
+def _build_ffmpeg_cmd(strm_path, thumb_path, timeline, loglevel="error"):
+    """组装 ffmpeg 命令行; timeline=None 表示取首帧(不 seek, 最保底)"""
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", loglevel]
+    cmd += _header_args()
     if timeline:
         cmd += ["-ss", timeline]
     cmd += ["-i", strm_path,
             "-vframes", "1", "-f", "image2", "-y", thumb_path]
     return cmd
+
+
+# ---- v1.0.11: 先探片长再决定截取时间点, 根治「时间点超过片长 → 退出码0零输出」 ----
+CLAMP_RATIO = 0.30        # 时间点超长时, 改取片长的 30% 处
+OVER_RATIO = 0.85         # 时间点超过片长 85% 即算「太长」(太靠片尾多为黑屏/字幕)
+PROBE_DURATION = _env("PROBE_DURATION", "1") != "0"   # 0=关闭探片长(每文件省一次请求)
+
+_DUR_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+
+def _tl_seconds(tl):
+    """HH:MM:SS -> 秒; 解析失败返回 None"""
+    try:
+        h, m, s = (int(x) for x in str(tl).split(":"))
+        return h * 3600 + m * 60 + s
+    except Exception:
+        return None
+
+
+def _fmt_ts(sec):
+    sec = max(int(sec), 0)
+    return "%02d:%02d:%02d" % (sec // 3600, sec % 3600 // 60, sec % 60)
+
+
+def _probe_duration(url):
+    """探片长(秒); 查不到返回 None。
+    优先 ffprobe(一次请求就能拿到时长); 镜像里没有 ffprobe 时退回 ffmpeg -i,
+    从 stderr 的 Duration 行解析。探不到不影响生成, 只是回到旧的盲 seek 逻辑。"""
+    try:
+        r = subprocess.run(
+            [FFPROBE, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1"] + _header_args() + [url],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=min(int(CFG["timeout"]), 90))
+        for tok in (r.stdout or "").split():
+            try:
+                v = float(tok)
+            except ValueError:
+                continue
+            if v > 0:
+                return v
+    except Exception:
+        pass
+    try:
+        r = subprocess.run([FFMPEG, "-hide_banner", "-i", url],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=min(int(CFG["timeout"]), 90))
+        m = _DUR_RE.search(r.stderr or "")
+        if m:
+            return (int(m.group(1)) * 3600 + int(m.group(2)) * 60
+                    + float(m.group(3)))
+    except Exception:
+        pass
+    return None
+
 
 
 # 诊断日志过滤关键词: ffmpeg debug 级输出很长, 只留与"为什么拉流失败"相关的行
@@ -315,15 +380,28 @@ def gen_thumb(strm_path, thumb_path, timeline):
     """ffmpeg 截帧; 成功返回 True。
     strm_path 实为 strm 文件里指向的视频 URL(可能是 http(s) 网盘直链)。
 
-    v1.0.10 截取策略:
-    1) 先按设定的时间点(timeline) seek 截取;
-    2) 若 seek「安静失败」(退出码0但没产出, stderr 为空——最典型的原因是时间点
-       超过了视频时长: ffmpeg seek 到片尾, 解出的帧时间都早于目标被丢弃, 于是零
-       输出也不报错), 自动改取首帧重试;
+    v1.0.11 截取策略:
+    0) 先探片长; 时间点若超过片长 85%, 自动改成片长的 30%(日志里写明片长),
+       短片(1~3 分钟)不会再因为 seek 越过片尾而「退出码0零输出且不报错」;
+    1) 再按(校正后的)时间点 seek 截取;
+    2) 若 seek「安静失败」(退出码0但没产出, stderr 为空——时间点超片长或直链
+       不支持中途定位), 自动改取首帧重试;
     3) 本轮连续 3 次 seek 安静失败后, 后续文件直接取首帧, 不再浪费请求;
     4) 取首帧也失败且看不到原因时, debug 级诊断一次(每轮仅一次, 防日志刷屏)。"""
     base = os.path.basename(strm_path)
     rc, err = None, ""
+    timeline = timeline or ""
+
+    # ---- v1.0.11: 按片长校正时间点 ----
+    if timeline:
+        tl = _tl_seconds(timeline)
+        dur = _probe_duration(strm_path) if PROBE_DURATION else None
+        if dur and tl is not None and tl > dur * OVER_RATIO:
+            new_tl = _fmt_ts(dur * CLAMP_RATIO)
+            log("片长 %s 短于截取时间点 %s, 改用 %s 截取: %s"
+                % (_fmt_ts(dur), timeline, new_tl, base))
+            timeline = new_tl
+            STATE["seek_miss"] = 0     # 已按片长校正, 不必因历史失败跳过 seek
     how = "seek %s" % (timeline or "(未设)")
 
     # 第 1 次: 按时间点 seek(本轮已连续失败则跳过, 不再浪费请求)
@@ -476,7 +554,7 @@ def _sleep_stoppable(seconds):
 
 # ---------------- Web 前端 ----------------
 
-VERSION = "1.0.10"      # 显示在页面标题旁, 便于确认容器跑的是哪版代码
+VERSION = "1.0.11"      # 显示在页面标题旁, 便于确认容器跑的是哪版代码
 
 PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -644,7 +722,7 @@ html[data-theme="dark"] .sellist .selitem{color:#4ade80}
       <div class="fld">
         <label>截取时间点</label>
         <input id="f-timeline" placeholder="00:03:01" spellcheck="false">
-        <span class="hint">HH:MM:SS; 超过视频时长时自动改取首帧保证出图; 想固定取开头就填 00:00:00</span>
+        <span class="hint">HH:MM:SS; 会先探片长: 时间点超过片长的 85% 时自动改成片长的 30% 处(日志会写片长), 所以填大一点也安全; 想固定取开头就填 00:00:00</span>
       </div>
       <div class="fld">
         <label>缩略图后缀</label>
@@ -1038,6 +1116,8 @@ def main():
         log("  ⚠ 配置文件读取失败(%s), 已回退环境变量配置" % err)
     log("  扫描目录   : %s" % (CFG["scan_paths"] or "(空)"))
     log("  截取时间点 : %s" % CFG["timeline"])
+    log("  探片长     : %s" % ("开(时间点超过片长 85% 时自动改成片长 30% 处)"
+                             if PROBE_DURATION else "关(PROBE_DURATION=0)"))
     log("  覆盖生成   : %s" % ("开" if CFG["overwrite"] else "关(只补缺失)"))
     log("  限速       : 每文件间隔 %ds, 每 %d 个休息 %ds"
         % (CFG["file_delay"], CFG["batch_size"], CFG["batch_rest"]))
