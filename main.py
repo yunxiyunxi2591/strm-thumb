@@ -57,7 +57,6 @@ CONFIG_PATH = _env("CONFIG_PATH", "/data/config.json")   # 配置文件路径(�
 # 运行时可调配置: 环境变量/默认值为初始值, 配置文件(若存在)整体覆盖, Web 保存后写回文件
 CFG = {
     "scan_paths": SCAN_PATHS_DEFAULT,                    # 扫描目录, 多个换行分隔
-    "exclude_paths": _split_multi(_env("EXCLUDE_PATHS", "")),  # 排除目录
     "timeline": _env("TIMELINE", "00:03:01"),            # 截取时间点 HH:MM:SS
     "suffix": _env("SUFFIX", "-thumb.jpg"),              # 缩略图后缀
     "overwrite": _env_bool("OVERWRITE", "0"),            # True=覆盖生成(默认只补缺失)
@@ -73,8 +72,8 @@ WEB_PORT = int(_env("WEB_PORT", "8081"))                        # Web 前端端�
 WEB_ENABLED = _env_bool("WEB_ENABLED", "1")                     # 0=关掉前端, 只当 worker
 
 # 可由 Web 编辑的字段(不含 web_port: 改端口要重启 HTTP 服务)
-# 注意: v1.0.5 起为纯手动模式, 不再有任何定时/自动扫描相关配置
-EDITABLE = ("scan_paths", "exclude_paths", "timeline", "suffix",
+# 注意: v1.0.5 起为纯手动模式, 不再有任何定时/自动扫描相关配置; v1.0.6 起移除排除目录
+EDITABLE = ("scan_paths", "timeline", "suffix",
             "overwrite", "file_delay", "batch_size", "batch_rest",
             "timeout")
 
@@ -151,7 +150,6 @@ def load_config_file():
             if k in data and data[k] not in (None, ""):
                 merged[k] = data[k]
         merged["scan_paths"] = _as_list(merged["scan_paths"])
-        merged["exclude_paths"] = _as_list(merged["exclude_paths"])
         merged["overwrite"] = _as_bool(merged["overwrite"])
         merged["timeout"] = max(_as_int(merged["timeout"], 300), 10)
         merged["timeline"] = str(merged["timeline"]).strip()
@@ -173,7 +171,6 @@ def validate_config(new):
     if not scan_paths:
         return None, "扫描目录不能为空"
     out["scan_paths"] = scan_paths
-    out["exclude_paths"] = _as_list(new.get("exclude_paths"))
     tl = str(new.get("timeline", "")).strip()
     parts = tl.split(":")
     if len(parts) != 3 or not all(p.isdigit() for p in parts):
@@ -301,12 +298,6 @@ def scan_once(source="手动"):
             if not root.exists():
                 log("扫描路径不存在, 跳过: %s" % base)
                 continue
-            excl = []
-            for e in CFG["exclude_paths"]:
-                try:
-                    excl.append(str(Path(e).resolve()))
-                except Exception:
-                    pass
             log("开始扫描: %s" % base)
             STATE["cur_path"] = base
             for fp in sorted(root.rglob("*.strm")):
@@ -315,12 +306,6 @@ def scan_once(source="手动"):
                     return tried, ok, skipped
                 STATE["cur_file"] = str(fp)
                 STATE["processed"] += 1
-                try:
-                    rp = str(fp.resolve())
-                    if any(rp.startswith(x) for x in excl):
-                        continue
-                except Exception:
-                    pass
                 thumb = fp.with_name(fp.stem + CFG["suffix"])
                 if not CFG["overwrite"] and thumb.exists():
                     skipped += 1
@@ -368,7 +353,7 @@ def _sleep_stoppable(seconds):
 
 # ---------------- Web 前端 ----------------
 
-VERSION = "1.0.5"       # 显示在页面标题旁, 便于确认容器跑的是哪版代码
+VERSION = "1.0.6"       # 显示在页面标题旁, 便于确认容器跑的是哪版代码
 
 PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -435,25 +420,37 @@ html[data-theme="dark"] .fld input,html[data-theme="dark"] .fld select,html[data
 .savebar .msg{font-size:12px;font-weight:700;color:#16a34a}
 .savebar .msg.err{color:#ef4444}
 .picker{display:flex;gap:8px;align-items:center}
-.picker select{flex:1;background:var(--bg2);color:var(--ink);border:1px solid rgba(0,0,0,.12);
-  border-radius:8px;padding:8px 10px;font-size:13px;font-family:inherit}
-html[data-theme="dark"] .picker select{border-color:rgba(255,255,255,.14)}
 .picker button,.addrow button{flex:none;padding:8px 12px;font-size:12px;border-radius:8px}
-.crumbs{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px;font-size:12px;color:var(--sub)}
+.dirpanel{margin-top:8px;border:1px solid rgba(0,0,0,.12);border-radius:10px;
+  background:var(--bg2);overflow:hidden}
+html[data-theme="dark"] .dirpanel{border-color:rgba(255,255,255,.14)}
+.dirlist{max-height:260px;overflow:auto;padding:4px}
+.ditem{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:7px;font-size:13px}
+.ditem:hover{background:var(--track)}
+.ditem input[type=checkbox]{flex:none;width:15px;height:15px;accent-color:#22c55e;cursor:pointer}
+.ditem .dname{flex:1;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ditem .dname:hover{color:var(--green);font-weight:700}
+.ditem .dgo{flex:none;color:var(--faint);font-size:11px;cursor:pointer;padding:0 4px}
+.ditem .dgo:hover{color:var(--ink)}
+.ditem.checked .dname{font-weight:700;color:#15803d}
+html[data-theme="dark"] .ditem.checked .dname{color:#4ade80}
+.dirlist .empty{padding:10px;font-size:12px;color:var(--faint);text-align:center}
+.selbar{border-top:1px dashed rgba(0,0,0,.12);padding:8px 10px;font-size:12px;color:var(--sub);
+  display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center}
+html[data-theme="dark"] .selbar{border-color:rgba(255,255,255,.14)}
+.selbar .selitem{display:inline-flex;align-items:center;gap:4px;background:rgba(34,197,94,.12);
+  border:1px solid rgba(34,197,94,.35);color:#15803d;border-radius:999px;
+  padding:2px 6px 2px 10px;font-weight:700;max-width:100%}
+html[data-theme="dark"] .selbar .selitem{color:#4ade80}
+.selbar .selitem span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px}
+.selbar .selitem b{cursor:pointer;opacity:.6;padding:0 2px}
+.selbar .selitem b:hover{opacity:1}
+.crumbs{display:flex;flex-wrap:wrap;gap:4px;margin:8px 8px 0;font-size:12px;color:var(--sub)}
 .crumbs span{cursor:pointer;padding:2px 6px;border-radius:6px}
 .crumbs span:hover{background:var(--track);color:var(--ink)}
 .crumbs span.cur{color:var(--ink);font-weight:700;cursor:default}
 .crumbs span.cur:hover{background:transparent}
 .crumbs i{color:var(--faint);font-style:normal;align-self:center}
-.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
-.chip{display:inline-flex;align-items:center;gap:6px;background:rgba(34,197,94,.12);
-  border:1px solid rgba(34,197,94,.35);color:#15803d;border-radius:999px;
-  padding:3px 6px 3px 11px;font-size:12px;font-weight:700;max-width:100%}
-html[data-theme="dark"] .chip{color:#4ade80}
-.chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.chip b{cursor:pointer;opacity:.6;padding:0 3px}
-.chip b:hover{opacity:1}
-.chips .empty{font-size:12px;color:var(--faint)}
 .addrow{display:flex;gap:8px;margin-top:8px}
 .addrow input{flex:1;background:var(--bg2);color:var(--ink);border:1px solid rgba(0,0,0,.12);
   border-radius:8px;padding:8px 10px;font-size:13px;font-family:inherit}
@@ -502,23 +499,20 @@ html[data-theme="dark"] .addrow input{border-color:rgba(255,255,255,.14)}
     <h2>配置(保存后写入 /data/config.json, 重启不丢失)</h2>
     <div class="frm">
       <div class="fld wide">
-        <label>扫描目录(下拉进入选择, 可添加多个)</label>
+        <label>扫描目录(浏览勾选, 可多选)</label>
         <div class="picker">
-          <select id="f-browse" title="选择子目录后点「进入」"></select>
-          <button type="button" class="gray" onclick="browseEnter()">进入 ↓</button>
-          <button type="button" onclick="browseAdd()">＋ 添加当前目录</button>
+          <button type="button" class="gray" id="f-browse-toggle" onclick="toggleDirPanel()">▼ 浏览目录(已选 <b id="f-selcount">0</b> 个)</button>
         </div>
-        <div class="crumbs" id="f-crumbs"></div>
-        <div class="chips" id="f-chips"></div>
+        <div class="dirpanel" id="f-dirpanel" hidden>
+          <div class="crumbs" id="f-crumbs"></div>
+          <div class="dirlist" id="f-dirlist"></div>
+          <div class="selbar" id="f-selbar"></div>
+        </div>
         <div class="addrow">
           <input id="f-manual" placeholder="或手动输入容器内路径, 如 /link/电影" spellcheck="false">
           <button type="button" class="gray" onclick="browseAddManual()">添加</button>
         </div>
-        <span class="hint">浏览的是容器内目录(把媒体库挂载到 /link 后, 在这里一层层点进去)</span>
-      </div>
-      <div class="fld wide">
-        <label>排除目录(每行一个, 可留空)</label>
-        <textarea id="f-excl" spellcheck="false"></textarea>
+        <span class="hint">点目录名自动进入下一层; 勾上前面的方块 = 确认扫描该目录(含其中的全部 .strm)</span>
       </div>
       <div class="fld">
         <label>截取时间点</label>
@@ -596,41 +590,67 @@ function flashMsg(t,err){
   m.className=err?'msg err':'msg'; m.textContent=(err?'✕ ':'')+t;
   setTimeout(()=>{m.className='msg';m.textContent='';},3000);
 }
-// ---- 扫描目录选择器 ----
-let browsePath='/',scanList=[],scanDirty=false;
+// ---- 扫描目录选择器(浏览+勾选) ----
+let browsePath='/',scanList=[],scanDirty=false,curDirs=[],dirLoaded=false;
 async function browseTo(p){
   browsePath=p; renderCrumbs();
-  const sel=document.getElementById('f-browse');
-  sel.innerHTML='<option value="">(读取中…)</option>';
+  const box=document.getElementById('f-dirlist');
+  box.innerHTML='<div class="empty">(读取中…)</div>';
   let d;
   try{ d=await fetchJSON('/api/browse?path='+encodeURIComponent(p),null,8000); }
-  catch(e){ sel.innerHTML='<option value="">(读取失败, 点「进入」重试)</option>'; return; }
-  if(!d.dirs||!d.dirs.length){ sel.innerHTML='<option value="">(此目录下没有子目录)</option>'; return; }
-  sel.innerHTML='<option value="">— 选择子目录('+d.dirs.length+') —</option>'+
-    d.dirs.map(x=>'<option value="'+esc(x)+'">'+esc(x)+'</option>').join('');
-  sel.selectedIndex=0;
+  catch(e){ box.innerHTML='<div class="empty">(读取失败, 重新点一次目录名重试)</div>'; return; }
+  curDirs=d.dirs||[]; dirLoaded=true;
+  renderDirList();
 }
-function browseEnter(){
-  const sel=document.getElementById('f-browse');
-  const v=sel.value; if(!v)return;
-  browseTo(browsePath==='/'?'/'+v:browsePath+'/'+v);
+function renderDirList(){
+  if(!dirLoaded)return;
+  const box=document.getElementById('f-dirlist');
+  if(!curDirs.length){ box.innerHTML='<div class="empty">(此目录下没有子目录)</div>'; return; }
+  box.innerHTML=curDirs.map(x=>{
+    const full=browsePath==='/'?'/'+x:browsePath+'/'+x;
+    const on=scanList.indexOf(full)>=0;
+    return '<div class="ditem'+(on?' checked':'')+'">'+
+      '<input type="checkbox" data-p="'+esc(full)+'"'+(on?' checked':'')+' title="勾选=扫描此目录">'+
+      '<span class="dname" data-dir="'+esc(full)+'" title="点击进入">'+esc(x)+'</span>'+
+      '<span class="dgo" data-dir="'+esc(full)+'" title="进入">▸</span></div>';
+  }).join('');
 }
-function browseAdd(){
-  if(!browsePath||browsePath==='/'){flashMsg('不能添加根目录 /, 请先进入子目录',true);return;}
-  if(scanList.indexOf(browsePath)<0){scanList.push(browsePath);scanDirty=true;renderChips();}
+function toggleScan(p,on){
+  const i=scanList.indexOf(p);
+  if(on&&i<0){scanList.push(p);scanDirty=true;}
+  if(!on&&i>=0){scanList.splice(i,1);scanDirty=true;}
+  renderSelBar(); renderDirList();
+}
+function scanRemove(i){
+  if(i>=0&&i<scanList.length){scanList.splice(i,1);scanDirty=true;renderSelBar();renderDirList();}
+}
+function renderSelBar(){
+  const sc=document.getElementById('f-selcount');
+  if(sc)sc.textContent=scanList.length;
+  const bar=document.getElementById('f-selbar');
+  if(!bar)return;
+  if(!scanList.length){
+    bar.innerHTML='<span style="color:var(--faint)">尚未选择扫描目录(勾选上面的目录, 或在下方手动输入添加)</span>';
+    return;
+  }
+  bar.innerHTML='<span>已选 '+scanList.length+' 个:</span>'+scanList.map((p,i)=>
+    '<span class="selitem"><span title="'+esc(p)+'">'+esc(p)+'</span>'+
+    '<b data-rm="'+i+'" title="移除">✕</b></span>').join('');
 }
 function browseAddManual(){
   const el=document.getElementById('f-manual');
   const v=el.value.trim(); if(!v)return;
-  if(scanList.indexOf(v)<0){scanList.push(v);scanDirty=true;renderChips();}
+  if(scanList.indexOf(v)<0){scanList.push(v);scanDirty=true;renderSelBar();renderDirList();}
   el.value='';
 }
-function scanRemove(i){scanList.splice(i,1);scanDirty=true;renderChips();}
-function renderChips(){
-  const box=document.getElementById('f-chips');
-  if(!scanList.length){box.innerHTML='<span class="empty">尚未添加扫描目录</span>';return;}
-  box.innerHTML=scanList.map((p,i)=>'<span class="chip"><span title="'+esc(p)+'">'+esc(p)+
-    '</span><b onclick="scanRemove('+i+')" title="移除">✕</b></span>').join('');
+function toggleDirPanel(){
+  const panel=document.getElementById('f-dirpanel');
+  const open=panel.hidden;
+  panel.hidden=!open;
+  const btn=document.getElementById('f-browse-toggle');
+  btn.innerHTML=(open?'▲ 收起(已选 ':'▼ 浏览目录(已选 ')+
+    '<b id="f-selcount">'+scanList.length+'</b> 个)';
+  if(open&&!dirLoaded)browseTo(browsePath||'/');
 }
 function renderCrumbs(){
   const box=document.getElementById('f-crumbs');
@@ -676,14 +696,13 @@ async function refresh(){
   // 填充配置表单(跳过用户正在编辑的框, 避免输入被打断)
   const F=(id,v)=>{const el=document.getElementById(id);
     if(el&&document.activeElement!==el)el.value=v;};
-  F('f-excl',(c.exclude_paths||[]).join(NL));
   F('f-timeline',c.timeline);F('f-suffix',c.suffix);
   F('f-overwrite',c.overwrite?'1':'0');
   F('f-filedelay',c.file_delay);F('f-batchsize',c.batch_size);F('f-batchrest',c.batch_rest);
   F('f-timeout',c.timeout);
   // 扫描目录: 用户未在本地增删时, 以后端配置为准
   if(!scanDirty && JSON.stringify(c.scan_paths||[])!==JSON.stringify(scanList)){
-    scanList=(c.scan_paths||[]).slice(); renderChips();
+    scanList=(c.scan_paths||[]).slice(); renderSelBar(); renderDirList();
   }
   const box=document.getElementById('logs');
   const atBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-30;
@@ -706,7 +725,6 @@ async function saveConfig(){
   if(!scanList.length){flashMsg('请先添加至少一个扫描目录',true);return;}
   const body={
     scan_paths:scanList.join(NL),
-    exclude_paths:document.getElementById('f-excl').value,
     timeline:document.getElementById('f-timeline').value,
     suffix:document.getElementById('f-suffix').value,
     overwrite:document.getElementById('f-overwrite').value,
@@ -724,15 +742,22 @@ async function saveConfig(){
   }catch(e){flashMsg('网络错误或超时',true);}
   btn.disabled=false; setTimeout(refresh,200);
 }
-// 状态轮询与目录选择器互相独立: 即使 /api/state 不通, 目录下拉照样能用
+// 状态轮询与目录选择器互相独立: 即使 /api/state 不通, 目录面板照样能用
 refresh(); setInterval(refresh,3000);
-renderChips();
-// 面包屑点击用事件委托, 避免在内嵌 JS 里拼 onclick 字符串(转义地狱)
-document.getElementById('f-crumbs').addEventListener('click',function(e){
+renderSelBar();
+// 目录面板事件委托(面包屑回跳/点名字进入/勾选/移除), 避免在内嵌 JS 里拼 onclick(转义地狱)
+const _dp=document.getElementById('f-dirpanel');
+_dp.addEventListener('click',function(e){
   const t=e.target;
-  if(t&&t.dataset&&t.dataset.p!==undefined)browseTo(t.dataset.p);
+  if(!t||!t.dataset)return;
+  if(t.dataset.dir!==undefined){browseTo(t.dataset.dir);return;}   // 点目录名进入
+  if(t.dataset.p!==undefined){browseTo(t.dataset.p);return;}      // 面包屑回跳
+  if(t.dataset.rm!==undefined){scanRemove(+t.dataset.rm);}        // 已选项移除
 });
-browseTo('/');
+_dp.addEventListener('change',function(e){
+  const t=e.target;
+  if(t&&t.type==='checkbox'&&t.dataset&&t.dataset.p!==undefined)toggleScan(t.dataset.p,t.checked);
+});
 </script>
 </body>
 </html>
@@ -849,17 +874,17 @@ def main():
     if not ok:
         log("  ⚠ 配置文件读取失败(%s), 已回退环境变量配置" % err)
     log("  扫描目录   : %s" % (CFG["scan_paths"] or "(空)"))
-    log("  排除目录   : %s" % (CFG["exclude_paths"] or "(无)"))
     log("  截取时间点 : %s" % CFG["timeline"])
     log("  覆盖生成   : %s" % ("开" if CFG["overwrite"] else "关(只补缺失)"))
     log("  限速       : 每文件间隔 %ds, 每 %d 个休息 %ds"
         % (CFG["file_delay"], CFG["batch_size"], CFG["batch_rest"]))
     log("  扫描方式   : 仅手动(点 Web 上的「立即扫描一次」才开始, 无任何定时/自动扫描)")
-    # 旧版定时环境变量提示: v1.0.5 起全部忽略, 避免"明明没开定时却自动扫"的困惑
-    _legacy = [k for k in ("CRON", "INTERVAL", "RUN_ON_START", "RUN_ONCE", "GEN_STRATEGY")
+    # 旧版环境变量提示: 定时类 v1.0.5 起忽略, 排除目录 v1.0.6 起忽略
+    _legacy = [k for k in ("CRON", "INTERVAL", "RUN_ON_START", "RUN_ONCE",
+                           "GEN_STRATEGY", "EXCLUDE_PATHS")
                if os.environ.get(k) not in (None, "")]
     if _legacy:
-        log("  ⚠ 检测到旧版定时/策略环境变量 %s —— v1.0.5 起为纯手动模式, 这些设置已全部忽略"
+        log("  ⚠ 检测到旧版环境变量 %s —— 定时类 v1.0.5 起、排除目录 v1.0.6 起已全部忽略"
             % ",".join(_legacy))
     log("  前端       : %s" % ("http://0.0.0.0:%d" % WEB_PORT if WEB_ENABLED else "关闭"))
     log("=" * 56)
