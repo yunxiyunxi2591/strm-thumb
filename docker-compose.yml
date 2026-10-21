@@ -5,9 +5,13 @@
 #   docker compose pull && docker compose up -d   升级到新版本
 # 前端: http://NAS的IP:8081  (状态/统计/日志 + 手动触发扫描按钮; 8080 常被 qBittorrent 占用, 故默认 8081)
 #
-# ★ 默认全手动: 容器启动后不会自动扫描, 打开 Web 点「▶ 立即扫描一次」才开始干活;
-#   所有配置(扫描目录/排除目录/截取时间点/策略/定时等)都在 Web 上改, 保存进 ./data/config.json,
-#   重启不丢失; 想改回"启动即扫"可在 Web 配置里打开「启动时自动扫描」。
+# ★ v1.0.5 起为纯手动模式(代码层面): 没有任何定时/启动自扫/循环,
+#   只有打开 Web 点「▶ 立即扫描一次」才开始扫描; 旧版 compose 里的
+#   CRON / INTERVAL / RUN_ON_START / RUN_ONCE / GEN_STRATEGY 一律忽略。
+#   所有配置(扫描目录/排除目录/截取时间点/限速等)都在 Web 上改,
+#   保存进 ./data/config.json, 重启不丢失。
+# ★ 限速(防打爆网盘触发风控): 每处理 1 个文件休息 FILE_DELAY 秒,
+#   每 BATCH_SIZE 个再休息 BATCH_REST 秒; 默认 5s / 30 个 / 60s。
 
 services:
   strm-thumb:
@@ -26,15 +30,13 @@ services:
       TIMELINE: "00:03:01"
       # 1=对所有文件重新生成; 0=只补缺失的(默认)
       OVERWRITE: "0"
-      # 每生成 N 个暂停 M 秒, 防止被网盘/风控限速
-      GEN_STRATEGY: "100=60"
-      # 定时: 5 位 cron 表达式(容器内 UTC 时间); 留空 + INTERVAL=0 = 纯手动, 不自动扫
-      # 例: "30 20 * * *" = 每天 UTC 20:30(北京 04:30)
-      CRON: ""
-      # 循环间隔(秒); 0 = 不循环(仅手动点扫描)
-      INTERVAL: "0"
-      # 1=容器启动时自动先扫一轮; 0=启动后待命, 只手动触发(默认)
-      RUN_ON_START: "0"
+      # ---- 限速(防网盘风控) ----
+      # 每处理完 1 个文件休息多少秒
+      FILE_DELAY: "5"
+      # 每处理多少个文件后进入批量休息
+      BATCH_SIZE: "30"
+      # 批量休息多少秒
+      BATCH_REST: "60"
       # 单个文件 ffmpeg 超时(秒), 慢速网盘可调大
       TIMEOUT: "300"
       # Web 前端端口; 设 0 关闭前端(只当后台 worker)

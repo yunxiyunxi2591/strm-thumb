@@ -9,13 +9,14 @@ WORKDIR /app
 COPY main.py /app/main.py
 
 # 默认扫描目录(容器内), 用 volumes 挂载真实媒体库
-# 注意: 默认不自动扫描(INTERVAL=0/无CRON/RUN_ON_START=0), 启动后点 Web 上的「立即扫描一次」才开始干活
+# 注意: v1.0.5 起为纯手动模式 —— 没有任何定时/启动自扫, 只有点 Web 上的「立即扫描一次」才开始干活;
+#       旧版 CRON/INTERVAL/RUN_ON_START/RUN_ONCE/GEN_STRATEGY 环境变量一律忽略
 ENV SCAN_PATHS=/link \
     TIMELINE=00:03:01 \
-    GEN_STRATEGY=100=60 \
+    FILE_DELAY=5 \
+    BATCH_SIZE=30 \
+    BATCH_REST=60 \
     OVERWRITE=0 \
-    INTERVAL=0 \
-    RUN_ON_START=0 \
     CONFIG_PATH=/data/config.json \
     WEB_PORT=8081 \
     WEB_ENABLED=1 \

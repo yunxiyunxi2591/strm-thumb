@@ -4,14 +4,16 @@
 STRM 缩略图生成器 — MoviePilot「FFmpegStrm缩略图」插件的容器化独立版
 
 原插件: https://github.com/imaliang/MoviePilot-Plugins (plugins/ffmpegstrmthumb)
-本容器不依赖 MoviePilot, 常驻运行, 定时扫描目录中的 .strm 文件,
+本容器不依赖 MoviePilot, 常驻运行, 扫描目录中的 .strm 文件,
 用 FFmpeg 从 strm 指向的视频里截取一帧, 保存为 <片名>-thumb.jpg。
 
 自带简易 Web 前端(默认 8081 端口): 查看状态/统计/日志, 手动触发扫描,
 并可在页面上编辑全部配置(保存到 /data/config.json, 重启不丢失)。
 
-默认完全手动: 容器启动不自动扫描, 也不循环; 需要定时可在 Web 上配置
-cron 或循环间隔, 需要启动即扫可打开「启动时自动扫描」。
+v1.0.5 起为纯手动模式: 没有任何定时/启动自扫/循环, 只有手动点
+「立即扫描一次」才开始干活(旧版 CRON/INTERVAL/RUN_ON_START/RUN_ONCE
+环境变量一律忽略)。为防打爆网盘/源站触发风控, 扫描内置限速:
+每处理 1 个文件休息 FILE_DELAY 秒, 每 BATCH_SIZE 个再休息 BATCH_REST 秒。
 
 纯 Python 标准库, 零第三方依赖; 初始配置走环境变量, 之后以配置文件为准。
 """
@@ -59,27 +61,25 @@ CFG = {
     "timeline": _env("TIMELINE", "00:03:01"),            # 截取时间点 HH:MM:SS
     "suffix": _env("SUFFIX", "-thumb.jpg"),              # 缩略图后缀
     "overwrite": _env_bool("OVERWRITE", "0"),            # True=覆盖生成(默认只补缺失)
-    "gen_strategy": _env("GEN_STRATEGY", "100=60"),      # 每生成 N 个暂停 M 秒
-    "cron": _env("CRON", ""),                            # 5 位 cron; 留空=不按 cron 定时
-    "interval": int(_env("INTERVAL", "0")),              # 循环间隔(秒); 0=不循环(仅手动)
-    "run_on_start": _env_bool("RUN_ON_START", "0"),      # True=启动时自动扫一轮
+    "file_delay": int(_env("FILE_DELAY", "5")),          # 每处理 1 个文件后休息(秒), 防打爆源站
+    "batch_size": int(_env("BATCH_SIZE", "30")),         # 每处理 N 个文件后进入批量休息
+    "batch_rest": int(_env("BATCH_REST", "60")),         # 批量休息时长(秒), 防风控
     "timeout": int(_env("TIMEOUT", "300")),              # 单个文件 ffmpeg 超时(秒)
 }
 CFG_SOURCE = "环境变量/默认值"      # 当前配置来源(启动日志用)
 
 FFMPEG = _env("FFMPEG_BIN", "ffmpeg")                           # ffmpeg 可执行文件
-RUN_ONCE = _env_bool("RUN_ONCE", "0")                           # 1=只跑一次就退出(首次补图用)
 WEB_PORT = int(_env("WEB_PORT", "8081"))                        # Web 前端端口(改端口需重启容器)
 WEB_ENABLED = _env_bool("WEB_ENABLED", "1")                     # 0=关掉前端, 只当 worker
 
 # 可由 Web 编辑的字段(不含 web_port: 改端口要重启 HTTP 服务)
+# 注意: v1.0.5 起为纯手动模式, 不再有任何定时/自动扫描相关配置
 EDITABLE = ("scan_paths", "exclude_paths", "timeline", "suffix",
-            "overwrite", "gen_strategy", "cron", "interval",
-            "run_on_start", "timeout")
+            "overwrite", "file_delay", "batch_size", "batch_rest",
+            "timeout")
 
 _STOP = False                # 退出进程
 _STOP_SCAN = False           # 停止当前扫描轮
-_cfg_changed = threading.Event()   # 配置已保存, 唤醒调度线程重读
 
 # ---------------- 状态(供前端展示) ----------------
 
@@ -96,7 +96,7 @@ STATE = {
     "last_start": None,
     "last_end": None,
     "last_stats": None,         # 上轮 (tried, ok, skipped)
-    "next_run": "-",            # 下次扫描时间
+    "next_run": "仅手动触发",    # 下次扫描时间(v1.0.5 纯手动, 恒定显示)
     "logs": deque(maxlen=300),
 }
 _scan_lock = threading.Lock()
@@ -111,12 +111,7 @@ def log(msg):
 def config_snapshot():
     """返回当前生效配置(供前端展示与表单填充)"""
     snap = {k: CFG[k] for k in EDITABLE}
-    if CFG["cron"]:
-        snap["schedule_display"] = "cron: %s" % CFG["cron"]
-    elif CFG["interval"] > 0:
-        snap["schedule_display"] = "每 %d 秒" % CFG["interval"]
-    else:
-        snap["schedule_display"] = "仅手动触发"
+    snap["schedule_display"] = "仅手动触发"   # v1.0.5 起无任何定时, 只有点「立即扫描」才扫
     return snap
 
 
@@ -158,13 +153,12 @@ def load_config_file():
         merged["scan_paths"] = _as_list(merged["scan_paths"])
         merged["exclude_paths"] = _as_list(merged["exclude_paths"])
         merged["overwrite"] = _as_bool(merged["overwrite"])
-        merged["run_on_start"] = _as_bool(merged["run_on_start"])
-        merged["interval"] = max(_as_int(merged["interval"]), 0)
         merged["timeout"] = max(_as_int(merged["timeout"], 300), 10)
         merged["timeline"] = str(merged["timeline"]).strip()
         merged["suffix"] = str(merged["suffix"]).strip()
-        merged["gen_strategy"] = str(merged["gen_strategy"]).strip()
-        merged["cron"] = str(merged["cron"]).strip()
+        merged["file_delay"] = min(max(_as_int(merged["file_delay"], 5), 0), 600)
+        merged["batch_size"] = min(max(_as_int(merged["batch_size"], 30), 1), 1000)
+        merged["batch_rest"] = min(max(_as_int(merged["batch_rest"], 60), 0), 3600)
         CFG.update(merged)
         CFG_SOURCE = CONFIG_PATH
         return True, None
@@ -193,25 +187,9 @@ def validate_config(new):
         return None, "缩略图后缀不能为空"
     out["suffix"] = suffix
     out["overwrite"] = _as_bool(new.get("overwrite"))
-    gs = str(new.get("gen_strategy", "")).strip()
-    if "=" not in gs:
-        return None, "生成策略格式应为 N=M(每生成 N 个暂停 M 秒)"
-    try:
-        n, m = (int(x) for x in gs.split("=", 1))
-        if n <= 0 or m < 0:
-            raise ValueError
-    except Exception:
-        return None, "生成策略应为正整数=非负整数, 如 100=60"
-    out["gen_strategy"] = gs
-    cron = str(new.get("cron", "")).strip()
-    if cron:
-        try:
-            Cron(cron)
-        except Exception as e:
-            return None, "cron 表达式错误: %r(需要 5 段: 分 时 日 月 周)" % e
-    out["cron"] = cron
-    out["interval"] = max(_as_int(new.get("interval")), 0)
-    out["run_on_start"] = _as_bool(new.get("run_on_start"))
+    out["file_delay"] = min(max(_as_int(new.get("file_delay"), 5), 0), 600)
+    out["batch_size"] = min(max(_as_int(new.get("batch_size"), 30), 1), 1000)
+    out["batch_rest"] = min(max(_as_int(new.get("batch_rest"), 60), 0), 3600)
     out["timeout"] = min(max(_as_int(new.get("timeout"), 300), 10), 3600)
     return out, None
 
@@ -231,7 +209,6 @@ def save_config(new):
         tmp.replace(p)                      # 原子替换, 避免写一半
     except Exception as e:
         return False, "配置已生效但写入文件失败: %r(重启后将丢失本次修改)" % e
-    _cfg_changed.set()                      # 唤醒调度线程重读
     log("配置已保存并写入 %s" % CONFIG_PATH)
     return True, "已保存"
 
@@ -258,72 +235,6 @@ def browse_dir(path):
         return str(p), parent, dirs, None
     except Exception as e:
         return None, None, None, repr(e)
-
-
-# ---------------- cron 解析(5 段: 分 时 日 月 周) ----------------
-
-def _parse_field(field, lo, hi):
-    """返回该字段允许的取值集合"""
-    allowed = set()
-    for part in field.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        step = 1
-        if "/" in part:
-            part, s = part.split("/", 1)
-            step = int(s)
-        if part in ("*", ""):
-            start, end = lo, hi
-        elif "-" in part:
-            a, b = part.split("-", 1)
-            start, end = int(a), int(b)
-        else:
-            start = end = int(part)
-            if "/" in field and step > 1:      # "5/10" 形式
-                end = hi
-        for v in range(start, end + 1, step):
-            if lo <= v <= hi:
-                allowed.add(v)
-    return allowed
-
-
-class Cron:
-    def __init__(self, expr):
-        f = expr.split()
-        if len(f) != 5:
-            raise ValueError("cron 需要 5 段: 分 时 日 月 周")
-        self.minutes = _parse_field(f[0], 0, 59)
-        self.hours = _parse_field(f[1], 0, 23)
-        self.dom = _parse_field(f[2], 1, 31)
-        self.month = _parse_field(f[3], 1, 12)
-        dow = _parse_field(f[4], 0, 7)
-        if 7 in dow:                     # 周日既可以是 0 也可以是 7
-            dow.add(0)
-        self.dow = {d % 7 for d in dow}
-
-    def match(self, dt):
-        if dt.minute not in self.minutes or dt.hour not in self.hours:
-            return False
-        if dt.month not in self.month:
-            return False
-        dom_ok = dt.day in self.dom
-        dow_ok = (dt.weekday() + 1) % 7 in self.dow      # python Mon=0 → cron Sun=0
-        if self.dom == set(range(1, 32)):
-            return True                                  # 日为 * 时只看周
-        if self.dow == set(range(0, 7)):
-            return dom_ok                                # 周为 * 时只看日
-        return dom_ok or dow_ok
-
-    def next_after(self, dt):
-        """从 dt 之后(不含当前分钟)找到下一个触发时刻"""
-        from datetime import timedelta
-        t = dt.replace(second=0, microsecond=0) + timedelta(minutes=1)
-        for _ in range(60 * 24 * 800):
-            if self.match(t):
-                return t
-            t += timedelta(minutes=1)
-        return None
 
 
 # ---------------- 核心逻辑 ----------------
@@ -365,21 +276,23 @@ def gen_thumb(strm_path, thumb_path, timeline):
 
 
 def scan_once(source="手动"):
-    """扫描一轮, 返回 (尝试数, 成功数, 跳过数)"""
+    """扫描一轮, 返回 (尝试数, 成功数, 跳过数)。
+    限速: 每个文件处理后休息 file_delay 秒; 每处理 batch_size 个再休息
+    batch_rest 秒(防止把网盘/源站打爆触发风控)。休息均可被「停止」打断。"""
     if not CFG["scan_paths"]:
         log("扫描目录为空, 无可扫描目录")
         return 0, 0, 0
     global _STOP_SCAN
     _STOP_SCAN = False
-    try:
-        max_count, delay = CFG["gen_strategy"].split("=")
-        max_count, delay = int(max_count), int(delay)
-    except Exception:
-        max_count, delay = 100, 60
+    file_delay = max(int(CFG["file_delay"]), 0)
+    batch_size = max(int(CFG["batch_size"]), 1)
+    batch_rest = max(int(CFG["batch_rest"]), 0)
     tried = ok = skipped = 0
-    count = 0
+    batch = 0                                    # 距上次批量休息已处理的文件数
     STATE.update(scanning=True, scan_source=source, cur_path="", cur_file="",
                  processed=0, last_start=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    log("本轮限速: 每文件间隔 %ds, 每 %d 个休息 %ds"
+        % (file_delay, batch_size, batch_rest))
     try:
         for base in CFG["scan_paths"]:
             if _STOP_SCAN or _STOP:
@@ -424,11 +337,20 @@ def scan_once(source="手动"):
                     log("已生成: %s" % thumb.name)
                 else:
                     STATE["failed_total"] += 1
-                count += 1
-                if count >= max_count:
-                    log("已生成 %d 个, 暂停 %d 秒(防风控)" % (count, delay))
-                    time.sleep(delay)
-                    count = 0
+                # ---- 限速: 先按文件间隔休息, 再按批量休息 ----
+                if _STOP_SCAN or _STOP:
+                    log("收到停止信号, 中断扫描")
+                    return tried, ok, skipped
+                if file_delay > 0:
+                    _sleep_stoppable(file_delay)
+                batch += 1
+                if batch >= batch_size:
+                    log("已处理 %d 个, 休息 %d 秒(防风控)" % (batch, batch_rest))
+                    if batch_rest > 0:
+                        STATE["cur_file"] = "⏸ 批量休息中(%ds, 防风控)" % batch_rest
+                        _sleep_stoppable(batch_rest)
+                        STATE["cur_file"] = ""
+                    batch = 0
             log("目录完成: %s" % base)
     finally:
         STATE.update(scanning=False, cur_path="", cur_file="",
@@ -437,63 +359,16 @@ def scan_once(source="手动"):
     return tried, ok, skipped
 
 
-def worker():
-    """调度线程: 启动时按 RUN_ON_START 决定是否自动扫; 之后仅在用户配置了
-    cron / interval 时才定时扫, 否则待命等手动触发(配置保存会唤醒重读)"""
-    if CFG["run_on_start"]:
-        log("RUN_ON_START=1, 启动时先扫描一轮")
-        t, o, s = scan_once("启动")
-        log("本轮结束: 尝试 %d / 成功 %d / 跳过(已存在) %d" % (t, o, s))
-        if RUN_ONCE:
-            log("RUN_ONCE=1, 退出")
-            os._exit(0)
-    else:
-        log("未开启启动自动扫描, 待命中(点「立即扫描一次」开始干活)")
-    while not _STOP:
-        # 读当前调度配置
-        cron = None
-        if CFG["cron"]:
-            try:
-                cron = Cron(CFG["cron"])
-            except Exception as e:
-                log("CRON 解析失败(%r), 本次不定时" % e)
-        if cron:
-            nxt = cron.next_after(datetime.now())
-            if nxt is None:
-                log("cron 无法解析出下一次触发时间, 停止定时")
-                cron = None
-            else:
-                STATE["next_run"] = nxt.strftime("%Y-%m-%d %H:%M")
-                wait = max((nxt - datetime.now()).total_seconds(), 0) + 1
-                log("下次扫描: %s (还有 %.0f 秒)" % (STATE["next_run"], wait))
-                _sleep_interruptible(wait)
-        elif CFG["interval"] > 0:
-            STATE["next_run"] = "%.0f 秒后" % CFG["interval"]
-            log("下次扫描: %s" % STATE["next_run"])
-            _sleep_interruptible(CFG["interval"])
-        else:
-            STATE["next_run"] = "仅手动触发"
-            _cfg_changed.wait(timeout=3600)   # 无自动调度, 等配置变更或退出
-            _cfg_changed.clear()
-            continue
-        if _STOP:
-            break
-        t, o, s = scan_once("定时")
-        log("本轮结束: 尝试 %d / 成功 %d / 跳过(已存在) %d" % (t, o, s))
-        if RUN_ONCE:
-            log("RUN_ONCE=1, 退出")
-            os._exit(0)
-
-
-def _sleep_interruptible(seconds):
-    end = time.time() + seconds
-    while not _STOP and time.time() < end:
-        if _cfg_changed.wait(timeout=min(5, max(end - time.time(), 0.1))):
-            _cfg_changed.clear()
-            return                      # 配置已改, 立即重读调度
+def _sleep_stoppable(seconds):
+    """限速休息: 每 0.2s 检查一次停止信号, 点「停止当前扫描」可立即打断"""
+    end = time.time() + max(float(seconds), 0)
+    while not _STOP and not _STOP_SCAN and time.time() < end:
+        time.sleep(min(0.2, max(end - time.time(), 0.01)))
 
 
 # ---------------- Web 前端 ----------------
+
+VERSION = "1.0.5"       # 显示在页面标题旁, 便于确认容器跑的是哪版代码
 
 PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -513,6 +388,8 @@ body{min-height:100vh;background:linear-gradient(168deg,var(--bg1),var(--bg2));
 .wrap{max-width:860px;margin:0 auto}
 .top{display:flex;align-items:center;gap:10px;padding:0 4px 14px}
 .top h1{font-size:18px;font-weight:800}
+.top h1 .ver{font-size:11px;background:var(--track);color:var(--sub);padding:2px 9px;
+  border-radius:999px;font-weight:700;margin-left:8px;vertical-align:2px;letter-spacing:.3px}
 .top .st{margin-left:auto;display:flex;align-items:center;gap:7px;font-size:12px;color:var(--sub);
   background:var(--card);border:1px solid rgba(0,0,0,.06);padding:5px 11px;border-radius:999px;
   box-shadow:var(--shadow);font-variant-numeric:tabular-nums}
@@ -585,8 +462,11 @@ html[data-theme="dark"] .addrow input{border-color:rgba(255,255,255,.14)}
 </head>
 <body>
 <div class="wrap">
+  <noscript><div style="background:#ef4444;color:#fff;padding:10px 14px;border-radius:10px;
+    margin-bottom:12px;font-size:13px;font-weight:700">⚠ 您的浏览器禁用了 JavaScript, 本页面无法工作。
+    请开启 JavaScript 后刷新, 或换用 Chrome / Edge 打开。<a href="/api/ping" style="color:#fff">点此测试接口是否通</a></div></noscript>
   <div class="top">
-    <h1>🎞️ STRM 缩略图生成器</h1>
+    <h1>🎞️ STRM 缩略图生成器<span class="ver" title="容器运行的代码版本">v__VERSION__</span></h1>
     <div class="st"><span class="pulse"></span><span id="meta">加载中…</span></div>
     <button class="gray" style="padding:7px 12px" onclick="toggleTheme()" title="切换主题">🌓</button>
   </div>
@@ -656,24 +536,19 @@ html[data-theme="dark"] .addrow input{border-color:rgba(255,255,255,.14)}
         </select>
       </div>
       <div class="fld">
-        <label>生成策略(每 N 个暂停 M 秒)</label>
-        <input id="f-strategy" placeholder="100=60" spellcheck="false">
+        <label>每个文件间隔(秒)</label>
+        <input id="f-filedelay" type="number" min="0" max="600" step="1">
+        <span class="hint">每处理完 1 个文件休息这么久, 防打爆网盘/源站</span>
       </div>
       <div class="fld">
-        <label>定时 cron(5 段: 分 时 日 月 周)</label>
-        <input id="f-cron" placeholder="留空 = 不自动定时" spellcheck="false">
-        <span class="hint">例 30 4 * * * = 每天 04:30(容器内 UTC)</span>
+        <label>每 N 个文件休息一次</label>
+        <input id="f-batchsize" type="number" min="1" max="1000" step="1">
+        <span class="hint">默认 30 个, 到数就休息下面设置的时长</span>
       </div>
       <div class="fld">
-        <label>循环间隔(秒, 0 = 不循环)</label>
-        <input id="f-interval" type="number" min="0" step="60">
-      </div>
-      <div class="fld">
-        <label>启动时自动扫描</label>
-        <select id="f-runstart">
-          <option value="0">关(只手动点扫描)</option>
-          <option value="1">开(容器启动先扫一轮)</option>
-        </select>
+        <label>批量休息时长(秒)</label>
+        <input id="f-batchrest" type="number" min="0" max="3600" step="10">
+        <span class="hint">默认 60 秒; 休息期间点「停止当前扫描」可立即中断</span>
       </div>
       <div class="fld">
         <label>单文件超时(秒)</label>
@@ -692,6 +567,11 @@ html[data-theme="dark"] .addrow input{border-color:rgba(255,255,255,.14)}
   </div>
 </div>
 <script>
+// 诊断标记: JS 一旦执行立刻改掉初始的"加载中…"
+// → 若右上角始终显示"加载中…"(从未变成"JS已运行…"), 说明 JS 根本没执行:
+//   浏览器禁用了 JS / 加载的是缓存旧页 / 浏览器太老不支持 async/await
+document.getElementById('meta').textContent='JS已运行, 正在连接后端…';
+const NL=String.fromCharCode(10);   // 换行符(避开 Python 字符串转义地狱)
 function toggleTheme(){
   const h=document.documentElement;
   const t=h.getAttribute('data-theme')==='dark'?'light':'dark';
@@ -755,11 +635,11 @@ function renderChips(){
 function renderCrumbs(){
   const box=document.getElementById('f-crumbs');
   const parts=browsePath.split('/').filter(x=>x);
-  let html='<span onclick="browseTo(\'/\')">/</span>',acc='';
+  let html='<span data-p="/">/</span>',acc='';
   parts.forEach((seg,i)=>{
     acc+='/'+seg;
     html+='<i>›</i>'+(i===parts.length-1?'<span class="cur">'+esc(seg)+'</span>':
-      '<span onclick="browseTo(\''+esc(acc)+'\')">'+esc(seg)+'</span>');
+      '<span data-p="'+esc(acc)+'">'+esc(seg)+'</span>');
   });
   box.innerHTML=html;
 }
@@ -796,18 +676,18 @@ async function refresh(){
   // 填充配置表单(跳过用户正在编辑的框, 避免输入被打断)
   const F=(id,v)=>{const el=document.getElementById(id);
     if(el&&document.activeElement!==el)el.value=v;};
-  F('f-excl',(c.exclude_paths||[]).join('\n'));
+  F('f-excl',(c.exclude_paths||[]).join(NL));
   F('f-timeline',c.timeline);F('f-suffix',c.suffix);
-  F('f-overwrite',c.overwrite?'1':'0');F('f-strategy',c.gen_strategy);
-  F('f-cron',c.cron||'');F('f-interval',c.interval);
-  F('f-runstart',c.run_on_start?'1':'0');F('f-timeout',c.timeout);
+  F('f-overwrite',c.overwrite?'1':'0');
+  F('f-filedelay',c.file_delay);F('f-batchsize',c.batch_size);F('f-batchrest',c.batch_rest);
+  F('f-timeout',c.timeout);
   // 扫描目录: 用户未在本地增删时, 以后端配置为准
   if(!scanDirty && JSON.stringify(c.scan_paths||[])!==JSON.stringify(scanList)){
     scanList=(c.scan_paths||[]).slice(); renderChips();
   }
   const box=document.getElementById('logs');
   const atBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-30;
-  box.textContent=(d.logs||[]).join('\\n')||'(暂无日志)';
+  box.textContent=(d.logs||[]).join(NL)||'(暂无日志)';
   if(atBottom)box.scrollTop=box.scrollHeight;
   document.getElementById('btn-run').disabled=!!d.scanning;
   document.getElementById('btn-stop').disabled=!d.scanning;
@@ -825,15 +705,14 @@ async function saveConfig(){
   const btn=document.getElementById('btn-save');
   if(!scanList.length){flashMsg('请先添加至少一个扫描目录',true);return;}
   const body={
-    scan_paths:scanList.join('\n'),
+    scan_paths:scanList.join(NL),
     exclude_paths:document.getElementById('f-excl').value,
     timeline:document.getElementById('f-timeline').value,
     suffix:document.getElementById('f-suffix').value,
     overwrite:document.getElementById('f-overwrite').value,
-    gen_strategy:document.getElementById('f-strategy').value,
-    cron:document.getElementById('f-cron').value,
-    interval:document.getElementById('f-interval').value,
-    run_on_start:document.getElementById('f-runstart').value,
+    file_delay:document.getElementById('f-filedelay').value,
+    batch_size:document.getElementById('f-batchsize').value,
+    batch_rest:document.getElementById('f-batchrest').value,
     timeout:document.getElementById('f-timeout').value
   };
   btn.disabled=true; msg.className='msg'; msg.textContent='保存中…';
@@ -847,11 +726,17 @@ async function saveConfig(){
 }
 // 状态轮询与目录选择器互相独立: 即使 /api/state 不通, 目录下拉照样能用
 refresh(); setInterval(refresh,3000);
-renderChips(); browseTo('/');
+renderChips();
+// 面包屑点击用事件委托, 避免在内嵌 JS 里拼 onclick 字符串(转义地狱)
+document.getElementById('f-crumbs').addEventListener('click',function(e){
+  const t=e.target;
+  if(t&&t.dataset&&t.dataset.p!==undefined)browseTo(t.dataset.p);
+});
+browseTo('/');
 </script>
 </body>
 </html>
-"""
+""".replace("__VERSION__", VERSION)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -897,6 +782,13 @@ class Handler(BaseHTTPRequestHandler):
             if _dt > 2:      # 正常应毫秒级; 慢了说明服务端有阻塞, 记日志便于排查
                 log("⚠ /api/state 响应耗时 %.1f 秒(异常, 正常应毫秒级)" % _dt)
             self._send(200, body)
+        elif self.path == "/api/ping":
+            # 无需 JS 的连通性测试: 浏览器直接打开这个地址能看到 JSON 即前后端通
+            self._send(200, json.dumps({
+                "ok": True, "version": VERSION,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "scanning": STATE["scanning"],
+            }))
         elif self.path.split("?")[0] == "/api/browse":
             q = parse_qs(urlparse(self.path).query)
             clean, parent, dirs, err = browse_dir((q.get("path") or ["/"])[0])
@@ -952,7 +844,7 @@ def main():
 
     ok, err = load_config_file()
     log("=" * 56)
-    log("STRM 缩略图生成器启动")
+    log("STRM 缩略图生成器启动  v%s" % VERSION)
     log("  配置来源   : %s" % CFG_SOURCE)
     if not ok:
         log("  ⚠ 配置文件读取失败(%s), 已回退环境变量配置" % err)
@@ -960,21 +852,22 @@ def main():
     log("  排除目录   : %s" % (CFG["exclude_paths"] or "(无)"))
     log("  截取时间点 : %s" % CFG["timeline"])
     log("  覆盖生成   : %s" % ("开" if CFG["overwrite"] else "关(只补缺失)"))
-    log("  生成策略   : %s" % CFG["gen_strategy"])
-    if CFG["cron"]:
-        log("  定时       : cron %s (容器内 UTC)" % CFG["cron"])
-    elif CFG["interval"] > 0:
-        log("  定时       : 每 %d 秒" % CFG["interval"])
-    else:
-        log("  定时       : 无(仅手动触发)")
-    log("  启动扫描   : %s" % ("开(启动即扫一轮)" if CFG["run_on_start"] else "关(手动点扫描才开始)"))
+    log("  限速       : 每文件间隔 %ds, 每 %d 个休息 %ds"
+        % (CFG["file_delay"], CFG["batch_size"], CFG["batch_rest"]))
+    log("  扫描方式   : 仅手动(点 Web 上的「立即扫描一次」才开始, 无任何定时/自动扫描)")
+    # 旧版定时环境变量提示: v1.0.5 起全部忽略, 避免"明明没开定时却自动扫"的困惑
+    _legacy = [k for k in ("CRON", "INTERVAL", "RUN_ON_START", "RUN_ONCE", "GEN_STRATEGY")
+               if os.environ.get(k) not in (None, "")]
+    if _legacy:
+        log("  ⚠ 检测到旧版定时/策略环境变量 %s —— v1.0.5 起为纯手动模式, 这些设置已全部忽略"
+            % ",".join(_legacy))
     log("  前端       : %s" % ("http://0.0.0.0:%d" % WEB_PORT if WEB_ENABLED else "关闭"))
     log("=" * 56)
 
     if WEB_ENABLED:
         srv = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-    threading.Thread(target=worker, daemon=True).start()
+    log("待命中: 只有手动点「立即扫描一次」才会开始扫描")
 
     while not _STOP:
         time.sleep(1)
